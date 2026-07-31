@@ -1,0 +1,16 @@
+services:
+  validator-alert-bot:
+    build: .
+    container_name: validator-alert-bot
+    restart: unless-stopped
+    environment:
+      - BOT_API_KEY=${BOT_API_KEY}
+    volumes:
+      - ./data:/app/data
+      # mount config so networks/aliases can be changed without rebuilding
+      - ./config:/app/config:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

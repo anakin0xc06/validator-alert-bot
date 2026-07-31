@@ -1,38 +1,70 @@
 {
   "cosmos": {
-    "rpc": "https://rpc-cosmoshub.omniflix.io",
-    "rest": "https://api-cosmoshub.omniflix.io"
+    "rpc": "https://cosmos-rpc.polkachu.com",
+    "rest": "https://cosmos-api.polkachu.com"
   },
-  "osmo": {
-    "rpc": "https://rpc-osmosis.omniflix.io",
-    "rest": "https://api-osmosis.omniflix.io"
+  "akash": {
+    "rpc": "https://akash-rpc.polkachu.com",
+    "rest": "https://akash-api.polkachu.com"
   },
   "juno": {
-    "rpc": "https://rpc-juno.omniflix.io",
-    "rest": "https://api-juno.omniflix.io"
-  },
-  "stars": {
-    "rpc": "",
-    "rest": ""
+    "rpc": "https://juno-rpc.polkachu.com",
+    "rest": "https://juno-api.polkachu.com"
   },
   "sent": {
-    "rpc": "",
-    "rest": ""
+    "rpc": "https://sentinel-rpc.polkachu.com",
+    "rest": "https://sentinel-api.polkachu.com"
   },
-  "comdex": {
-    "rpc": "",
-    "rest": ""
+  "persistence": {
+    "rpc": "https://persistence-rpc.polkachu.com",
+    "rest": "https://persistence-api.polkachu.com"
   },
-  "ki": {
-    "rpc": "",
-    "rest": ""
+  "sei": {
+    "rpc": "https://sei-rpc.polkachu.com",
+    "rest": "https://sei-api.polkachu.com"
   },
   "omniflix": {
-    "rpc": "",
-    "rest": ""
+    "rpc": "https://omniflix-rpc.polkachu.com",
+    "rest": "https://omniflix-api.polkachu.com"
   },
   "agoric": {
-    "rpc": "",
-    "rest": ""
+    "rpc": "https://agoric-rpc.polkachu.com",
+    "rest": "https://agoric-api.polkachu.com"
+  },
+  "celestia": {
+    "rpc": "https://celestia-rpc.polkachu.com",
+    "rest": "https://celestia-api.polkachu.com"
+  },
+  "dydx": {
+    "rpc": "https://dydx-rpc.polkachu.com",
+    "rest": "https://dydx-api.polkachu.com"
+  },
+  "story": {
+    "rpc": "https://story-rpc.polkachu.com",
+    "rest": "https://story-api.polkachu.com"
+  },
+  "zen": {
+    "rpc": "https://rpc.diamond.zenrocklabs.io",
+    "rest": "https://api.diamond.zenrocklabs.io"
+  },
+  "bitway": {
+    "rpc": "https://bitway-rpc.polkachu.com",
+    "rest": "https://bitway-api.polkachu.com"
+  },
+  "union": {
+    "rpc": "https://union-rpc.polkachu.com",
+    "rest": "https://union-api.polkachu.com"
+  },
+  "lumera": {
+     "rpc": "https://lumera-rpc.polkachu.com",
+     "rest": "https://lumera-api.polkachu.com"
+  },
+  "pb": {
+     "rpc": "https://provenance-rpc.polkachu.com",
+     "rest": "https://provenance-api.polkachu.com"
+  },
+  "inj": {
+     "rpc": "https://injective-rpc.polkachu.com",
+     "rest": "https://injective-api.polkachu.com"
   }
 }

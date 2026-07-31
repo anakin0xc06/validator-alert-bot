@@ -1,0 +1,14 @@
+[
+  {
+    "network": "cosmos",
+    "moniker": "My Validator",
+    "valcons_address": "cosmosvalcons1...",
+    "validator_address": "cosmosvaloper1..."
+  },
+  {
+    "network": "akash",
+    "moniker": "Another Validator",
+    "valcons_address": "akashvalcons1...",
+    "validator_address": "akashvaloper1..."
+  }
+]
