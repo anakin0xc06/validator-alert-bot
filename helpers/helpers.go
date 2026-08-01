@@ -214,12 +214,15 @@ func GetSignedBlocksWindow(restApi string) (int64, error) {
 }
 
 // ChainUpgradePlan is a scheduled x/upgrade plan discovered either through a
-// passed governance proposal or the upgrade module's current_plan query
+// governance proposal (voting or passed) or the upgrade module's
+// current_plan query
 type ChainUpgradePlan struct {
-	ProposalID string // empty when only found via current_plan
-	Name       string
-	Height     int64
-	Info       string
+	ProposalID    string // empty when only found via current_plan
+	Name          string
+	Height        int64
+	Info          string
+	Status        string    // e.g. "PROPOSAL_STATUS_VOTING_PERIOD" or "PROPOSAL_STATUS_PASSED"
+	VotingEndTime time.Time // zero value unless Status is still voting
 }
 
 type statusResponse struct {
@@ -266,8 +269,9 @@ type currentPlanResponse struct {
 // GetCurrentUpgradePlan queries the x/upgrade module's own record of the
 // currently scheduled plan. It is authoritative (it's what the chain will
 // actually act on) but has no associated proposal ID, so it's used as a
-// fallback/cross-check alongside GetPassedSoftwareUpgrades rather than the
-// primary discovery source. Returns nil, nil when no plan is scheduled.
+// fallback/cross-check alongside GetSoftwareUpgradeProposals rather than the
+// primary discovery source. Returns nil, nil when no plan is scheduled. A
+// plan only ever shows up here once its proposal has passed.
 func GetCurrentUpgradePlan(restApi string) (*ChainUpgradePlan, error) {
 	url := restApi + "/cosmos/upgrade/v1beta1/current_plan"
 	resp, err := httpClient.Get(url)
@@ -290,7 +294,7 @@ func GetCurrentUpgradePlan(restApi string) (*ChainUpgradePlan, error) {
 	if err != nil || height <= 0 {
 		return nil, nil
 	}
-	return &ChainUpgradePlan{Name: body.Plan.Name, Height: height, Info: body.Plan.Info}, nil
+	return &ChainUpgradePlan{Name: body.Plan.Name, Height: height, Info: body.Plan.Info, Status: govStatusPassed}, nil
 }
 
 // govAnyEnvelope decodes the flattened cosmos-sdk Any JSON encoding used for
@@ -317,16 +321,26 @@ func isSoftwareUpgradeType(typeUrl string) bool {
 	return strings.Contains(typeUrl, "SoftwareUpgrade")
 }
 
+// gov proposal status query values (shared numbering between gov v1 and
+// v1beta1's ProposalStatus enum)
+const (
+	govStatusVotingPeriod = "2"
+	govStatusPassed       = "3"
+)
+
+var govProposalStatuses = []string{govStatusVotingPeriod, govStatusPassed}
+
 type govV1ProposalsResponse struct {
 	Proposals []struct {
-		ID       string            `json:"id"`
-		Status   string            `json:"status"`
-		Messages []json.RawMessage `json:"messages"`
+		ID            string            `json:"id"`
+		Status        string            `json:"status"`
+		VotingEndTime time.Time         `json:"voting_end_time"`
+		Messages      []json.RawMessage `json:"messages"`
 	} `json:"proposals"`
 }
 
-func fetchGovV1Upgrades(restApi string) (plans []ChainUpgradePlan, cancelled bool, err error) {
-	url := restApi + "/cosmos/gov/v1/proposals?proposal_status=3&pagination.limit=50&pagination.reverse=true"
+func fetchGovV1Upgrades(restApi, status string) (plans []ChainUpgradePlan, cancelled bool, err error) {
+	url := restApi + "/cosmos/gov/v1/proposals?proposal_status=" + status + "&pagination.limit=50&pagination.reverse=true"
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return nil, false, err
@@ -356,7 +370,14 @@ func fetchGovV1Upgrades(restApi string) (plans []ChainUpgradePlan, cancelled boo
 			if err != nil || height <= 0 {
 				continue
 			}
-			plans = append(plans, ChainUpgradePlan{ProposalID: proposal.ID, Name: msg.Plan.Name, Height: height, Info: msg.Plan.Info})
+			plans = append(plans, ChainUpgradePlan{
+				ProposalID:    proposal.ID,
+				Name:          msg.Plan.Name,
+				Height:        height,
+				Info:          msg.Plan.Info,
+				Status:        proposal.Status,
+				VotingEndTime: proposal.VotingEndTime,
+			})
 		}
 	}
 	return plans, cancelled, nil
@@ -364,14 +385,15 @@ func fetchGovV1Upgrades(restApi string) (plans []ChainUpgradePlan, cancelled boo
 
 type govV1Beta1ProposalsResponse struct {
 	Proposals []struct {
-		ProposalID string          `json:"proposal_id"`
-		Status     string          `json:"status"`
-		Content    json.RawMessage `json:"content"`
+		ProposalID    string          `json:"proposal_id"`
+		Status        string          `json:"status"`
+		VotingEndTime time.Time       `json:"voting_end_time"`
+		Content       json.RawMessage `json:"content"`
 	} `json:"proposals"`
 }
 
-func fetchGovV1Beta1Upgrades(restApi string) (plans []ChainUpgradePlan, cancelled bool, err error) {
-	url := restApi + "/cosmos/gov/v1beta1/proposals?proposal_status=3&pagination.limit=50&pagination.reverse=true"
+func fetchGovV1Beta1Upgrades(restApi, status string) (plans []ChainUpgradePlan, cancelled bool, err error) {
+	url := restApi + "/cosmos/gov/v1beta1/proposals?proposal_status=" + status + "&pagination.limit=50&pagination.reverse=true"
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		return nil, false, err
@@ -403,37 +425,62 @@ func fetchGovV1Beta1Upgrades(restApi string) (plans []ChainUpgradePlan, cancelle
 		if err != nil || height <= 0 {
 			continue
 		}
-		plans = append(plans, ChainUpgradePlan{ProposalID: proposal.ProposalID, Name: content.Plan.Name, Height: height, Info: content.Plan.Info})
+		plans = append(plans, ChainUpgradePlan{
+			ProposalID:    proposal.ProposalID,
+			Name:          content.Plan.Name,
+			Height:        height,
+			Info:          content.Plan.Info,
+			Status:        proposal.Status,
+			VotingEndTime: proposal.VotingEndTime,
+		})
 	}
 	return plans, cancelled, nil
 }
 
-// GetPassedSoftwareUpgrades queries both gov v1 and gov v1beta1 passed
-// proposals for software-upgrade plans and reports whether a cancellation
-// message was seen. Results are deduped by proposal ID. A failure on one
-// endpoint is non-fatal (chains only need to support one of the two); this
-// only returns an error if both fail.
-func GetPassedSoftwareUpgrades(restApi string) ([]ChainUpgradePlan, bool, error) {
-	v1Plans, v1Cancelled, v1Err := fetchGovV1Upgrades(restApi)
-	if v1Err != nil {
-		log.Printf("gov v1 proposals query failed for %s: %v", restApi, v1Err)
+// GetSoftwareUpgradeProposals queries both gov v1 and gov v1beta1 proposals,
+// in both the voting-period and passed states, for software-upgrade plans,
+// and reports whether a cancellation message was seen. Results are deduped
+// by proposal ID. A failure on an individual endpoint/status query is
+// logged and non-fatal (chains only need to support one gov version); this
+// only returns an error if every query fails.
+func GetSoftwareUpgradeProposals(restApi string) ([]ChainUpgradePlan, bool, error) {
+	var allPlans []ChainUpgradePlan
+	var cancelled bool
+	var lastErr error
+	successCount := 0
+
+	for _, status := range govProposalStatuses {
+		if plans, c, err := fetchGovV1Upgrades(restApi, status); err != nil {
+			log.Printf("gov v1 proposals (status=%s) query failed for %s: %v", status, restApi, err)
+			lastErr = err
+		} else {
+			successCount++
+			allPlans = append(allPlans, plans...)
+			cancelled = cancelled || c
+		}
+
+		if plans, c, err := fetchGovV1Beta1Upgrades(restApi, status); err != nil {
+			log.Printf("gov v1beta1 proposals (status=%s) query failed for %s: %v", status, restApi, err)
+			lastErr = err
+		} else {
+			successCount++
+			allPlans = append(allPlans, plans...)
+			cancelled = cancelled || c
+		}
 	}
-	legacyPlans, legacyCancelled, legacyErr := fetchGovV1Beta1Upgrades(restApi)
-	if legacyErr != nil {
-		log.Printf("gov v1beta1 proposals query failed for %s: %v", restApi, legacyErr)
-	}
-	if v1Err != nil && legacyErr != nil {
-		return nil, false, fmt.Errorf("gov v1: %v; gov v1beta1: %v", v1Err, legacyErr)
+
+	if successCount == 0 {
+		return nil, false, lastErr
 	}
 
 	seen := make(map[string]bool)
 	var plans []ChainUpgradePlan
-	for _, p := range append(v1Plans, legacyPlans...) {
+	for _, p := range allPlans {
 		if seen[p.ProposalID] {
 			continue
 		}
 		seen[p.ProposalID] = true
 		plans = append(plans, p)
 	}
-	return plans, v1Cancelled || legacyCancelled, nil
+	return plans, cancelled, nil
 }

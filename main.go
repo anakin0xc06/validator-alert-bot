@@ -149,10 +149,10 @@ Commands:
 /subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, jailing and slashing-risk alerts
 /unsubscribe — remove all your subscriptions
 /uptime — signing window, missed blocks and uptime of your validators
-/upgrades — list currently tracked chain-upgrade proposals, target heights and ETA (works in groups too)
+/upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA (works in groups too)
 /help — show this help
 
-Alerts: 🟡 missing blocks, 🔴 missing a lot of blocks, 🟢 recovering, 🚨 jailed / slashing risk. A 💚 health ping is sent every 6 hours. Chain upgrades: ⏰ upgrade incoming (1 day and 1-2 hours before), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
+Alerts: 🟡 missing blocks, 🔴 missing a lot of blocks, 🟢 recovering, 🚨 jailed / slashing risk. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
 
 // MainHandler ...
 func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {

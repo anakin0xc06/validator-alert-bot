@@ -14,16 +14,25 @@ import (
 	tgbotapi "gopkg.in/telegram-bot-api.v4"
 )
 
+// govStatusPassed is the proposal status string the gov REST APIs report
+// once a proposal has passed (as opposed to still being voted on)
+const govStatusPassed = "PROPOSAL_STATUS_PASSED"
+
 // TrackedUpgrade is a scheduled chain upgrade the bot is watching, persisted
-// across restarts so alerts are not re-sent
+// across restarts so alerts are not re-sent. Upgrades whose proposal is
+// still in the voting period are tracked (and shown in /upgrades) so
+// operators get an early heads-up, but only ever alerted on automatically
+// once Status reaches govStatusPassed, since a plan isn't confirmed until then.
 type TrackedUpgrade struct {
-	Network     string `json:"network"`
-	ProposalID  string `json:"proposal_id"`
-	Name        string `json:"name"`
-	Height      int64  `json:"height"`
-	Info        string `json:"info,omitempty"`
-	AlertedDay  bool   `json:"alerted_day"`
-	AlertedHour bool   `json:"alerted_hour"`
+	Network       string    `json:"network"`
+	ProposalID    string    `json:"proposal_id"`
+	Name          string    `json:"name"`
+	Height        int64     `json:"height"`
+	Info          string    `json:"info,omitempty"`
+	Status        string    `json:"status"`
+	VotingEndTime time.Time `json:"voting_end_time,omitempty"`
+	AlertedDay    bool      `json:"alerted_day"`
+	AlertedHour   bool      `json:"alerted_hour"`
 }
 
 // BlockSample is the most recently observed (height, time) pair for a
@@ -116,12 +125,15 @@ func checkNetworkUpgrade(prefix, rest, rpc string) []string {
 	avgBlockTime := avgBlockTimes[prefix]
 	upgradeMu.Unlock()
 
-	plans, cancelled, err := helpers.GetPassedSoftwareUpgrades(rest)
+	// covers both voting-period and passed software-upgrade proposals, so
+	// operators get an early heads-up before a vote even concludes
+	plans, cancelled, err := helpers.GetSoftwareUpgradeProposals(rest)
 	if err != nil {
 		log.Printf("Failed to get gov proposals for %s: %v", prefix, err)
 	}
-	// current_plan is the upgrade module's own authoritative record; used as
-	// a fallback in case proposal parsing/pagination missed something
+	// current_plan is the upgrade module's own authoritative record of a
+	// confirmed (passed) plan; used as a fallback in case proposal
+	// parsing/pagination missed something
 	if currentPlan, cpErr := helpers.GetCurrentUpgradePlan(rest); cpErr != nil {
 		log.Printf("Failed to get current upgrade plan for %s: %v", prefix, cpErr)
 	} else if currentPlan != nil {
@@ -151,37 +163,57 @@ func checkNetworkUpgrade(prefix, rest, rpc string) []string {
 		}
 	}
 
+	discovered := make(map[string]bool, len(plans))
 	for _, plan := range plans {
 		if plan.Height <= height {
 			continue // already at/past this height, nothing to track
 		}
 		key := upgradeKey(prefix, plan)
+		discovered[key] = true
 		if tracked, exists := trackedUpgrades[key]; exists {
 			tracked.Height = plan.Height
 			tracked.Name = plan.Name
+			tracked.Status = plan.Status
+			tracked.VotingEndTime = plan.VotingEndTime
 			if plan.ProposalID != "" {
 				tracked.ProposalID = plan.ProposalID
 			}
 			continue
 		}
 		trackedUpgrades[key] = &TrackedUpgrade{
-			Network:    prefix,
-			ProposalID: plan.ProposalID,
-			Name:       plan.Name,
-			Height:     plan.Height,
-			Info:       plan.Info,
+			Network:       prefix,
+			ProposalID:    plan.ProposalID,
+			Name:          plan.Name,
+			Height:        plan.Height,
+			Info:          plan.Info,
+			Status:        plan.Status,
+			VotingEndTime: plan.VotingEndTime,
 		}
-		log.Printf("Tracking new upgrade on %s: %s at height %d (proposal #%s)", prefix, plan.Name, plan.Height, plan.ProposalID)
+		log.Printf("Tracking new upgrade on %s: %s at height %d (proposal #%s, status %s)", prefix, plan.Name, plan.Height, plan.ProposalID, plan.Status)
 	}
 
 	for key, tracked := range trackedUpgrades {
 		if tracked.Network != prefix {
 			continue
 		}
-		if height >= tracked.Height {
-			alerts = append(alerts, fmt.Sprintf("✅ *Upgrade Height Reached*\n\nNetwork: *%s*\nUpgrade *%s* (target height %d) has been reached at current height %d. Make sure your validator node has upgraded.", strings.ToUpper(prefix), tracked.Name, tracked.Height, height))
+		// a still-voting proposal that dropped out of discovery was either
+		// rejected/failed or expired; nothing was ever alerted on it, so
+		// just drop it quietly. Passed upgrades are never pruned this way
+		// (they persist purely on height, in case they fall off pagination).
+		if tracked.Status != govStatusPassed && !discovered[key] {
+			log.Printf("Dropping no-longer-active upgrade proposal on %s: %s (proposal #%s)", prefix, tracked.Name, tracked.ProposalID)
 			delete(trackedUpgrades, key)
 			continue
+		}
+		if height >= tracked.Height {
+			if tracked.Status == govStatusPassed {
+				alerts = append(alerts, fmt.Sprintf("✅ *Upgrade Height Reached*\n\nNetwork: *%s*\nUpgrade *%s* (target height %d) has been reached at current height %d. Make sure your validator node has upgraded.", strings.ToUpper(prefix), tracked.Name, tracked.Height, height))
+			}
+			delete(trackedUpgrades, key)
+			continue
+		}
+		if tracked.Status != govStatusPassed {
+			continue // still just a proposal, don't push ETA alerts until it's confirmed
 		}
 		if avgBlockTime <= 0 {
 			continue // no block-time estimate yet, wait for the next sample
@@ -282,9 +314,19 @@ func HandleUpgradesCommand(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	var sb strings.Builder
 	sb.WriteString("🛠 *Active Upgrades*\n")
 	for _, u := range pending {
-		sb.WriteString(fmt.Sprintf("\n*%s* — %s\n", strings.ToUpper(u.Network), u.Name))
+		icon := "🗳"
+		if u.Status == govStatusPassed {
+			icon = "✅"
+		}
+		sb.WriteString(fmt.Sprintf("\n%s *%s* — %s\n", icon, strings.ToUpper(u.Network), u.Name))
 		if u.ProposalID != "" {
 			sb.WriteString(fmt.Sprintf("Proposal: #%s\n", u.ProposalID))
+		}
+		if u.Status != govStatusPassed {
+			sb.WriteString("Status: in voting, not yet confirmed\n")
+			if !u.VotingEndTime.IsZero() {
+				sb.WriteString(fmt.Sprintf("Voting ends: %s\n", u.VotingEndTime.UTC().Format(time.RFC1123)))
+			}
 		}
 		sb.WriteString(fmt.Sprintf("Target height: *%d*\n", u.Height))
 
@@ -296,7 +338,7 @@ func HandleUpgradesCommand(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		if hasSample {
 			remaining := u.Height - sample.Height
 			sb.WriteString(fmt.Sprintf("Current height: %d (%d blocks remaining)\n", sample.Height, remaining))
-			if avg > 0 {
+			if avg > 0 && u.Status == govStatusPassed {
 				eta := time.Duration(remaining) * avg
 				sb.WriteString(fmt.Sprintf("Estimated time: ~%s (around %s)\n", formatDuration(eta), time.Now().UTC().Add(eta).Format(time.RFC1123)))
 			}
