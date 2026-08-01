@@ -28,10 +28,14 @@ Thresholds and intervals are constants in [config/config.go](config/config.go).
 
 ## Validator aliases (optional)
 
-Alerts identify validators by their `valcons` address. To show friendly monikers instead, copy
+Alerts identify validators by their `valcons` address. To show a friendly `Moniker (network)`
+label instead, copy
 [config/validator_aliases.example.json](config/validator_aliases.example.json) to
-`config/validator_aliases.json` and fill in your validators. The file is gitignored and fully
-optional — without it the bot works the same, alerts just show the raw address.
+`config/validator_aliases.json` and fill in your validators. When an alias includes the
+`network` and `validator_address` (valoper) fields, alerts, health checks and `/uptime` also
+include a `mintscan.io/<network>/validators/<valoper>` link so you can verify missed blocks on
+the explorer. The file is gitignored and fully optional — without it the bot works the same,
+alerts just show the raw address and skip the explorer link.
 
 ## Running
 

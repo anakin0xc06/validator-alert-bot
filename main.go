@@ -32,7 +32,7 @@ var (
 
 	// read-only after initBot
 	networks         = make(map[string]map[string]string)
-	validatorAliases = make(map[string]string)
+	validatorAliases = make(map[string]ValidatorAlias)
 )
 
 type ValidatorAlias struct {
@@ -97,7 +97,7 @@ func initBot() {
 	var aliases []ValidatorAlias
 	loadJSONFile(config.ValidatorAliasesFile, &aliases, false)
 	for _, alias := range aliases {
-		validatorAliases[alias.ValconsAddress] = alias.Moniker
+		validatorAliases[alias.ValconsAddress] = alias
 	}
 	log.Printf("Loaded %d subscriber(s), %d network(s), %d alias(es)", len(subscribers), len(networks), len(validatorAliases))
 }
@@ -275,6 +275,9 @@ func HandleUptime(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 			dot, status = "🔴", "UNSAFE (jailed)"
 		}
 		sb.WriteString(fmt.Sprintf("\n%s %s\nWindow: %d blocks\nCurrently missing: %d\nUptime: %.2f%% — *%s*\n", dot, name, window, missed, uptime, status))
+		if link := mintscanLink(validator); link != "" {
+			sb.WriteString(fmt.Sprintf("🔗 [Check on Mintscan](%s)\n", link))
+		}
 	}
 	helpers.SendMessage(bot, update, sb.String(), tgbotapi.ModeMarkdown)
 }
@@ -288,10 +291,36 @@ func getPrefix(addr string) string {
 }
 
 func displayName(address string) string {
-	if moniker, ok := validatorAliases[address]; ok {
-		return fmt.Sprintf("%s (%s)", moniker, address)
+	if alias, ok := validatorAliases[address]; ok && alias.Moniker != "" {
+		network := alias.Network
+		if network == "" {
+			network = getPrefix(address)
+		}
+		return fmt.Sprintf("%s (%s)", alias.Moniker, network)
+	}
+	if prefix := getPrefix(address); prefix != "" {
+		return fmt.Sprintf("%s (%s)", address, prefix)
 	}
 	return address
+}
+
+// mintscanLink returns the explorer URL for a validator, or "" when the
+// alias config has no network/valoper mapping for it
+func mintscanLink(address string) string {
+	alias, ok := validatorAliases[address]
+	if !ok || alias.Network == "" || alias.ValidatorAddress == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://mintscan.io/%s/validators/%s", alias.Network, alias.ValidatorAddress)
+}
+
+// withMintscanLink appends an explorer link so subscribers can verify
+// missed blocks directly on Mintscan
+func withMintscanLink(text, validator string) string {
+	if link := mintscanLink(validator); link != "" {
+		return text + fmt.Sprintf("\n\n🔗 [Check on Mintscan](%s)", link)
+	}
+	return text
 }
 
 func getSignedBlocksWindow(prefix string) int64 {
@@ -373,6 +402,9 @@ func CheckValidator(validator string) []string {
 	}
 
 	validatorsMissedBlocks[validator] = currentMissedBlocks
+	for i := range alerts {
+		alerts[i] = withMintscanLink(alerts[i], validator)
+	}
 	return alerts
 }
 
@@ -448,6 +480,9 @@ func SendHealthCheck(bot *tgbotapi.BotAPI) {
 				state = "⚠️ missing blocks (" + level + ")"
 			}
 			sb.WriteString(fmt.Sprintf("\n%s\nmissed blocks: %d — %s\n", displayName(validator), validatorsMissedBlocks[validator], state))
+			if link := mintscanLink(validator); link != "" {
+				sb.WriteString(fmt.Sprintf("🔗 [Check on Mintscan](%s)\n", link))
+			}
 		}
 		stateMu.Unlock()
 		sb.WriteString(fmt.Sprintf("\nMissed-block checks run every %d minutes, next health ping in %d hours.", config.CheckIntervalSeconds/60, config.HealthCheckIntervalHours))
