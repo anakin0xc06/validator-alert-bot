@@ -145,11 +145,11 @@ func runSafe(name string, fn func()) {
 
 const helpText = `*Cosmic Validator Alerts Bot*
 
-Commands:
-/subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, jailing and slashing-risk alerts
+Commands (work in groups as well as DMs):
+/subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, jailing and slashing-risk alerts. Alerts are always DM'd to you directly, so message me privately at least once or they won't arrive.
 /unsubscribe — remove all your subscriptions
 /uptime — signing window, missed blocks and uptime of your validators
-/upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA (works in groups too)
+/upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA
 /help — show this help
 
 Alerts: 🟡 missing blocks, 🔴 missing a lot of blocks, 🟢 recovering, 🚨 jailed / slashing risk. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
@@ -162,17 +162,11 @@ func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	command := update.Message.Command()
 	log.Printf("Command /%s from user %d", command, helpers.GetUserID(update))
 
-	// /upgrades is read-only and has no per-user state, so unlike the
-	// subscription commands below it also works in group chats
-	if command == "upgrades" {
-		HandleUpgradesCommand(bot, update)
-		return
-	}
-
-	if !update.Message.Chat.IsPrivate() {
-		return
-	}
-
+	// All commands work in both group chats and DMs. /subscribe is the one
+	// exception worth calling out: alerts are always delivered by DM'ing
+	// the subscribing user directly (sendTo uses their user ID as the chat
+	// ID), which silently fails if that user has never messaged the bot
+	// privately, regardless of which chat they ran /subscribe from.
 	switch command {
 	case "start", "help":
 		helpers.SendMessage(bot, update, helpText, tgbotapi.ModeMarkdown)
@@ -182,6 +176,8 @@ func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		HandleUnsubscribe(bot, update)
 	case "uptime":
 		HandleUptime(bot, update)
+	case "upgrades":
+		HandleUpgradesCommand(bot, update)
 	default:
 		helpers.SendMessage(bot, update, "Unknown command, see /help", tgbotapi.ModeMarkdown)
 	}
@@ -215,7 +211,11 @@ func HandleSubscribe(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 			}
 			saveJSONFile(config.SubscribersFile, subscribers)
 			subsMu.Unlock()
-			helpers.SendMessage(bot, update, "Subscribed to alerts. Use /uptime to see the current status.", tgbotapi.ModeHTML)
+			confirmation := "Subscribed to alerts. Use /uptime to see the current status."
+			if !update.Message.Chat.IsPrivate() {
+				confirmation += fmt.Sprintf("\n\n❗ Alerts are delivered by DM. If you haven't messaged me privately before, open https://t.me/%s and press Start, or alerts won't reach you.", bot.Self.UserName)
+			}
+			helpers.SendMessage(bot, update, confirmation, tgbotapi.ModeHTML)
 			return
 		} else {
 			helpers.SendMessage(bot, update, "Invalid args: no valid valcons addresses found", tgbotapi.ModeHTML)

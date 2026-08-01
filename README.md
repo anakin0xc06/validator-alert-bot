@@ -18,12 +18,14 @@ Telegram bot that watches Cosmos-SDK validators and alerts subscribers about mis
 
 ## Bot commands
 
+All commands work in group chats as well as DMs.
+
 | Command | Description |
 |---|---|
-| `/subscribe <valcons addresses ...>` | Subscribe to alerts for one or more validators |
+| `/subscribe <valcons addresses ...>` | Subscribe to alerts for one or more validators. Alerts are always sent by DM to the subscribing user, regardless of which chat `/subscribe` was run from — if that user has never messaged the bot privately, Telegram won't let it DM them, so alerts silently never arrive. Run it from a group and the confirmation message calls this out with a link to start a DM. |
 | `/unsubscribe` | Remove all your subscriptions |
 | `/uptime` | Show window size, currently missed blocks, uptime % and 🟢/🔴 safety per validator |
-| `/upgrades` | List full details (proposal, target height, ETA) for every currently tracked chain-upgrade — works in group chats as well as DMs |
+| `/upgrades` | List full details (proposal, target height, ETA) for every currently tracked chain-upgrade |
 | `/help` | Show help |
 
 Thresholds and intervals are constants in [config/config.go](config/config.go).
