@@ -448,12 +448,15 @@ func fetchGovV1Beta1Upgrades(restApi, status string) (plans []ChainUpgradePlan, 
 	return plans, cancelled, nil
 }
 
-// GetSoftwareUpgradeProposals queries both gov v1 and gov v1beta1 proposals,
-// in both the voting-period and passed states, for software-upgrade plans,
-// and reports whether a cancellation message was seen. Results are deduped
-// by proposal ID. A failure on an individual endpoint/status query is
-// logged and non-fatal (chains only need to support one gov version); this
-// only returns an error if every query fails.
+// GetSoftwareUpgradeProposals queries gov v1 proposals, in both the
+// voting-period and passed states, for software-upgrade plans, and reports
+// whether a cancellation message was seen. gov v1beta1 is only queried as a
+// fallback when v1 itself fails for a given status (e.g. older chains that
+// never got gov v1, or a chain like Sei that 501s on it) — not run
+// alongside v1 unconditionally, since chains that do support v1 (e.g.
+// Cosmos Hub) can have a broken/lossy v1beta1 compatibility shim that would
+// otherwise fail loudly on every cycle for no reason. Results are deduped
+// by proposal ID. This only returns an error if every query fails.
 func GetSoftwareUpgradeProposals(restApi string) ([]ChainUpgradePlan, bool, error) {
 	var allPlans []ChainUpgradePlan
 	var cancelled bool
@@ -461,23 +464,25 @@ func GetSoftwareUpgradeProposals(restApi string) ([]ChainUpgradePlan, bool, erro
 	successCount := 0
 
 	for _, status := range govProposalStatuses {
-		if plans, c, err := fetchGovV1Upgrades(restApi, status); err != nil {
-			log.Printf("gov v1 proposals (status=%s) query failed for %s: %v", status, restApi, err)
-			lastErr = err
-		} else {
+		plans, c, err := fetchGovV1Upgrades(restApi, status)
+		if err == nil {
 			successCount++
 			allPlans = append(allPlans, plans...)
 			cancelled = cancelled || c
+			continue
 		}
+		log.Printf("gov v1 proposals (status=%s) query failed for %s: %v; falling back to gov v1beta1", status, restApi, err)
+		lastErr = err
 
-		if plans, c, err := fetchGovV1Beta1Upgrades(restApi, status); err != nil {
-			log.Printf("gov v1beta1 proposals (status=%s) query failed for %s: %v", status, restApi, err)
-			lastErr = err
-		} else {
-			successCount++
-			allPlans = append(allPlans, plans...)
-			cancelled = cancelled || c
+		legacyPlans, legacyCancelled, legacyErr := fetchGovV1Beta1Upgrades(restApi, status)
+		if legacyErr != nil {
+			log.Printf("gov v1beta1 proposals (status=%s) query failed for %s: %v", status, restApi, legacyErr)
+			lastErr = legacyErr
+			continue
 		}
+		successCount++
+		allPlans = append(allPlans, legacyPlans...)
+		cancelled = cancelled || legacyCancelled
 	}
 
 	if successCount == 0 {
