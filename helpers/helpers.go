@@ -225,12 +225,19 @@ type ChainUpgradePlan struct {
 	VotingEndTime time.Time // zero value unless Status is still voting
 }
 
+type statusSyncInfo struct {
+	LatestBlockHeight string    `json:"latest_block_height"`
+	LatestBlockTime   time.Time `json:"latest_block_time"`
+}
+
+// statusResponse covers both shapes the /status RPC endpoint is seen to
+// return in the wild: classic Tendermint/CometBFT wraps sync_info in a
+// JSON-RPC "result" envelope, while some newer CometBFT versions (observed
+// on Sei) return sync_info directly at the top level with no envelope.
 type statusResponse struct {
-	Result struct {
-		SyncInfo struct {
-			LatestBlockHeight string    `json:"latest_block_height"`
-			LatestBlockTime   time.Time `json:"latest_block_time"`
-		} `json:"sync_info"`
+	SyncInfo statusSyncInfo `json:"sync_info"`
+	Result   struct {
+		SyncInfo statusSyncInfo `json:"sync_info"`
 	} `json:"result"`
 }
 
@@ -251,11 +258,15 @@ func GetLatestBlock(rpcApi string) (int64, time.Time, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return 0, time.Time{}, err
 	}
-	height, err := strconv.ParseInt(body.Result.SyncInfo.LatestBlockHeight, 10, 64)
+	syncInfo := body.SyncInfo
+	if syncInfo.LatestBlockHeight == "" {
+		syncInfo = body.Result.SyncInfo
+	}
+	height, err := strconv.ParseInt(syncInfo.LatestBlockHeight, 10, 64)
 	if err != nil {
 		return 0, time.Time{}, err
 	}
-	return height, body.Result.SyncInfo.LatestBlockTime, nil
+	return height, syncInfo.LatestBlockTime, nil
 }
 
 type currentPlanResponse struct {
