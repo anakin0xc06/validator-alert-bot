@@ -99,6 +99,7 @@ func initBot() {
 	for _, alias := range aliases {
 		validatorAliases[alias.ValconsAddress] = alias
 	}
+	loadUpgradeState()
 	log.Printf("Loaded %d subscriber(s), %d network(s), %d alias(es)", len(subscribers), len(networks), len(validatorAliases))
 }
 
@@ -148,29 +149,41 @@ Commands:
 /subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, jailing and slashing-risk alerts
 /unsubscribe — remove all your subscriptions
 /uptime — signing window, missed blocks and uptime of your validators
+/upgrades — list currently tracked chain-upgrade proposals, target heights and ETA (works in groups too)
 /help — show this help
 
-Alerts: 🟡 missing blocks, 🔴 missing a lot of blocks, 🟢 recovering, 🚨 jailed / slashing risk. A 💚 health ping is sent every 6 hours.`
+Alerts: 🟡 missing blocks, 🔴 missing a lot of blocks, 🟢 recovering, 🚨 jailed / slashing risk. A 💚 health ping is sent every 6 hours. Chain upgrades: ⏰ upgrade incoming (1 day and 1-2 hours before), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
 
 // MainHandler ...
 func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	if update.Message == nil || !update.Message.IsCommand() {
+		return
+	}
+	command := update.Message.Command()
+	log.Printf("Command /%s from user %d", command, helpers.GetUserID(update))
 
-	if update.Message != nil && update.Message.IsCommand() && update.Message.Chat.IsPrivate() {
-		command := update.Message.Command()
-		log.Printf("Command /%s from user %d", command, helpers.GetUserID(update))
+	// /upgrades is read-only and has no per-user state, so unlike the
+	// subscription commands below it also works in group chats
+	if command == "upgrades" {
+		HandleUpgradesCommand(bot, update)
+		return
+	}
 
-		switch command {
-		case "start", "help":
-			helpers.SendMessage(bot, update, helpText, tgbotapi.ModeMarkdown)
-		case "subscribe":
-			HandleSubscribe(bot, update)
-		case "unsubscribe":
-			HandleUnsubscribe(bot, update)
-		case "uptime":
-			HandleUptime(bot, update)
-		default:
-			helpers.SendMessage(bot, update, "Unknown command, see /help", tgbotapi.ModeMarkdown)
-		}
+	if !update.Message.Chat.IsPrivate() {
+		return
+	}
+
+	switch command {
+	case "start", "help":
+		helpers.SendMessage(bot, update, helpText, tgbotapi.ModeMarkdown)
+	case "subscribe":
+		HandleSubscribe(bot, update)
+	case "unsubscribe":
+		HandleUnsubscribe(bot, update)
+	case "uptime":
+		HandleUptime(bot, update)
+	default:
+		helpers.SendMessage(bot, update, "Unknown command, see /help", tgbotapi.ModeMarkdown)
 	}
 }
 
@@ -515,9 +528,11 @@ func contains(s []string, str string) bool {
 func SubscribersHandleScheduler(bot *tgbotapi.BotAPI) {
 	runSafe("missed blocks check", func() { HandleSubscribers(bot) })
 	runSafe("health check", func() { SendHealthCheck(bot) })
+	runSafe("upgrade check", func() { HandleUpgrades(bot) })
 	s := gocron.NewScheduler()
 	log.Println("Starting blocks monitoring scheduler ...")
 	s.Every(config.CheckIntervalSeconds).Seconds().Do(runSafe, "missed blocks check", func() { HandleSubscribers(bot) })
 	s.Every(config.HealthCheckIntervalHours).Hours().Do(runSafe, "health check", func() { SendHealthCheck(bot) })
+	s.Every(config.UpgradeCheckIntervalSeconds).Seconds().Do(runSafe, "upgrade check", func() { HandleUpgrades(bot) })
 	<-s.Start()
 }

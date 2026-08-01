@@ -12,6 +12,7 @@ Telegram bot that watches Cosmos-SDK validators and alerts subscribers about mis
   - 🟢 **Recovering** — missed-block counter is going back down after an alert
 - 🚨 Jailing / tombstoning alerts and ✅ unjail notices
 - 💚 Health ping every **6 hours** with a per-validator status summary, so you know the bot itself is alive
+- ⏰ Chain-upgrade watcher: tracks passed governance software-upgrade proposals per network and warns **1 day** and **1-2 hours** before the estimated upgrade time (see below)
 - Alert state is persisted in `./data`, so restarts do not re-send alerts
 - Supports any network listed in [config/networks.json](config/networks.json); validators are identified by their bech32 `valcons` address
 
@@ -22,9 +23,26 @@ Telegram bot that watches Cosmos-SDK validators and alerts subscribers about mis
 | `/subscribe <valcons addresses ...>` | Subscribe to alerts for one or more validators |
 | `/unsubscribe` | Remove all your subscriptions |
 | `/uptime` | Show window size, currently missed blocks, uptime % and 🟢/🔴 safety per validator |
+| `/upgrades` | List full details (proposal, target height, ETA) for every currently tracked chain-upgrade — works in group chats as well as DMs |
 | `/help` | Show help |
 
 Thresholds and intervals are constants in [config/config.go](config/config.go).
+
+## Upgrade watcher
+
+Every **15 minutes** the bot polls each network in [config/networks.json](config/networks.json) for
+passed governance proposals of the software-upgrade type (checking both the modern `gov/v1`
+message format and the legacy `gov/v1beta1` proposal-content format, plus the `x/upgrade`
+module's own `current_plan` query as a fallback). For each scheduled upgrade it tracks the
+target height and estimates time-to-upgrade from a self-measured average block time (sampled
+each check cycle, so the estimate adapts to each chain's real block speed and survives
+restarts). Subscribers are notified based on the networks of their subscribed validators:
+
+- ⏰ **Upgrade Incoming** — fires once ~24 hours out and again once ~1-2 hours out
+- ✅ **Upgrade Height Reached** — the target height has been passed; the upgrade is removed from state
+- ⚠️ **Upgrade Cancelled** — a cancellation was observed via governance; the upgrade is removed from state
+
+Upgrade-watcher state is persisted to `./data/upgrades.json`.
 
 ## Validator aliases (optional)
 

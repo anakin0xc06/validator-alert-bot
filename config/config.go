@@ -7,6 +7,7 @@ var (
 	SubscribersFile      = "./data/subscribers.json"
 	ValidatorsFile       = "./data/validators.json"
 	StateFile            = "./data/state.json"
+	UpgradesFile         = "./data/upgrades.json"
 	NetworksFile         = "./config/networks.json"
 	ValidatorAliasesFile = "./config/validator_aliases.json"
 )
@@ -22,4 +23,10 @@ const (
 	CheckIntervalSeconds = 300
 	// HealthCheckIntervalHours how often the bot reports that it is alive
 	HealthCheckIntervalHours = 6
+	// UpgradeCheckIntervalSeconds how often the bot polls governance proposals and block heights for scheduled upgrades
+	UpgradeCheckIntervalSeconds = 900
+	// UpgradeDayWarningHours how long before the estimated upgrade time the first warning fires
+	UpgradeDayWarningHours = 24
+	// UpgradeHourWarningHours how long before the estimated upgrade time the final warning fires
+	UpgradeHourWarningHours = 2
 )
