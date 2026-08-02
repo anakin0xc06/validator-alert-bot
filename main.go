@@ -30,8 +30,6 @@ var (
 	validatorAlertLevels   = make(map[string]string)
 	validatorJailed        = make(map[string]bool)
 	slashingParamsCache    = make(map[string]slashingParamsEntry)
-	validatorEpisodeMissed = make(map[string]int64)
-	validatorStreak        = make(map[string]int64)
 
 	// read-only after initBot
 	networks         = make(map[string]map[string]string)
@@ -48,10 +46,8 @@ type ValidatorAlias struct {
 // BotState is the alert state persisted across restarts so the bot does not
 // re-send jail/level alerts after a redeploy
 type BotState struct {
-	AlertLevels   map[string]string `json:"alert_levels"`
-	Jailed        map[string]bool   `json:"jailed"`
-	EpisodeMissed map[string]int64  `json:"episode_missed"`
-	Streak        map[string]int64  `json:"streak"`
+	AlertLevels map[string]string `json:"alert_levels"`
+	Jailed      map[string]bool   `json:"jailed"`
 }
 
 func loadJSONFile(path string, v interface{}, required bool) {
@@ -97,12 +93,6 @@ func initBot() {
 	}
 	if state.Jailed != nil {
 		validatorJailed = state.Jailed
-	}
-	if state.EpisodeMissed != nil {
-		validatorEpisodeMissed = state.EpisodeMissed
-	}
-	if state.Streak != nil {
-		validatorStreak = state.Streak
 	}
 
 	var aliases []ValidatorAlias
@@ -158,14 +148,14 @@ func runSafe(name string, fn func()) {
 const helpText = `*Cosmic Validator Alerts Bot*
 
 Commands (work in groups as well as DMs):
-/subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, jailing and slashing-risk alerts. Alerts are always DM'd to you directly, so message me privately at least once or they won't arrive.
+/subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, uptime and jailing alerts. Alerts are always DM'd to you directly, so message me privately at least once or they won't arrive.
 /unsubscribe — remove all your subscriptions
 /uptime — signing window, missed blocks and uptime of your validators
 /dashboard — uptime and safety for every validator configured in validator_aliases.json
 /upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA
 /help — show this help
 
-Alerts: 🟡 missing blocks, 🔴 missing a lot of blocks, 🟢 recovering, 🚨 jailed / slashing risk. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
+Alerts: 🟡 missed blocks > 50, 🔴 missed blocks ≥ 150, 📉 uptime dropping, 🟢 recovering, 🚨 jailed / tombstoned. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
 
 // MainHandler ...
 func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
@@ -547,78 +537,38 @@ func getSignedBlocksWindow(prefix string) int64 {
 	return getSlashingParamsCached(prefix).Window
 }
 
-// decideMissedBlocksAlert is the pure decision logic behind CheckValidator's
-// missed-blocks alerting. It tracks missed blocks as a cumulative "episode"
-// (episodeMissed) plus a consecutive-checks streak instead of judging each
-// check against only the previous one, so a validator that keeps missing a
-// moderate number of blocks check after check still gets escalated, and
-// "recovering" only fires on a real, large drop rather than sliding-window
-// noise. It touches no global state so it can be tested without a network
-// call.
-func decideMissedBlocksAlert(name string, currentMissedBlocks, window int64, hasPrevious bool, previousMissedBlocks int64, level string, episodeMissed, streak int64) (alerts []string, newLevel string, newEpisodeMissed, newStreak int64) {
-	delta := currentMissedBlocks - previousMissedBlocks
-	interval := config.CheckIntervalSeconds / 60
-
-	var uptimePct float64
-	if window > 0 {
-		uptimePct = float64(window-currentMissedBlocks) * 100 / float64(window)
-	}
-
-	newEpisodeMissed = episodeMissed
-	if hasPrevious && delta > 0 {
-		newEpisodeMissed += delta
-	}
-
-	if hasPrevious && delta >= config.YellowMissedBlocksLimit {
-		newStreak = streak + 1
-	} else {
-		newStreak = 0
-	}
-
-	escalate := newEpisodeMissed >= config.CriticalMissedBlocksLimit || newStreak >= config.CriticalConsecutiveChecks
+// decideMissedBlocksAlert is the decision logic behind CheckValidator's
+// missed-blocks alerting: total (raw) missed blocks against fixed
+// thresholds, plus a separate alert whenever the slashing-window uptime %
+// drops by a meaningful amount since the last check. No history beyond the
+// previous check is kept. It touches no global state so it can be tested
+// without a network call.
+func decideMissedBlocksAlert(name string, currentMissedBlocks, window int64, hasPrevious bool, previousMissedBlocks int64, level string) (alerts []string, newLevel string) {
 	newLevel = level
 
-	switch {
-	case window > 0 && currentMissedBlocks*100 >= window*config.CriticalWindowPercent:
-		if level != "critical" || currentMissedBlocks > previousMissedBlocks {
-			alerts = append(alerts, fmt.Sprintf("🚨 *CRITICAL: Slashing Risk*\n\n%s is missing *%d* of the last *%d* blocks (%.1f%% of the slashing window) and is at risk of being jailed and slashed.", name, currentMissedBlocks, window, float64(currentMissedBlocks)*100/float64(window)))
+	if hasPrevious && window > 0 {
+		previousUptime := float64(window-previousMissedBlocks) * 100 / float64(window)
+		currentUptime := float64(window-currentMissedBlocks) * 100 / float64(window)
+		if previousUptime-currentUptime >= config.UptimeDropAlertPercent {
+			alerts = append(alerts, fmt.Sprintf("📉 *Uptime Dropping*\n\n%s's slashing-window uptime dropped from *%.2f%%* to *%.2f%%* (missed blocks %d → %d).", name, previousUptime, currentUptime, previousMissedBlocks, currentMissedBlocks))
 		}
-		newLevel = "critical"
-
-	// Checked before the episode-based cases below: a real, large drop is
-	// strong enough evidence of recovery that it should clear the episode
-	// even if the historical episodeMissed/streak totals are still high.
-	// Otherwise episodeMissed only ever resets inside this case, so once it
-	// crosses the yellow/critical thresholds the cases below would always
-	// match first and recovery could never be reached.
-	case hasPrevious && level != "" && previousMissedBlocks-currentMissedBlocks >= config.RecoveryMissedBlocksDrop:
-		suffix := ""
-		if window > 0 {
-			suffix = fmt.Sprintf(" Window uptime back up to *%.2f%%*.", uptimePct)
-		}
-		alerts = append(alerts, fmt.Sprintf("🟢 *Recovering*\n\n%s is signing again, missed blocks decreasing: *%d → %d*.%s", name, previousMissedBlocks, currentMissedBlocks, suffix))
-		newLevel = ""
-		newEpisodeMissed = 0
-		newStreak = 0
-
-	case hasPrevious && escalate:
-		suffix := ""
-		if window > 0 {
-			suffix = fmt.Sprintf(" Window uptime: *%.2f%%*.", uptimePct)
-		}
-		alerts = append(alerts, fmt.Sprintf("🔴 *CRITICAL: Missing Blocks*\n\n%s has missed *%d* blocks overall in the current episode (%d → %d, +%d in the last %d minutes).%s This looks like a sustained problem — please check the node immediately.", name, newEpisodeMissed, previousMissedBlocks, currentMissedBlocks, delta, interval, suffix))
-		newLevel = "critical"
-
-	case hasPrevious && newEpisodeMissed >= config.YellowMissedBlocksLimit:
-		suffix := ""
-		if window > 0 {
-			suffix = fmt.Sprintf(" Window uptime: *%.2f%%*.", uptimePct)
-		}
-		alerts = append(alerts, fmt.Sprintf("🟡 *Missed Blocks Alert*\n\n%s is missing blocks: *%d → %d* (+%d in the last %d minutes, %d missed overall in this episode).%s", name, previousMissedBlocks, currentMissedBlocks, delta, interval, newEpisodeMissed, suffix))
-		newLevel = "yellow"
 	}
 
-	return alerts, newLevel, newEpisodeMissed, newStreak
+	switch {
+	case currentMissedBlocks >= config.MissedBlocksCriticalLimit:
+		alerts = append(alerts, fmt.Sprintf("🔴 *CRITICAL: Missing Blocks*\n\n%s has missed *%d* blocks. Please check the node immediately.", name, currentMissedBlocks))
+		newLevel = "critical"
+
+	case currentMissedBlocks > config.MissedBlocksAlertLimit:
+		alerts = append(alerts, fmt.Sprintf("🟡 *Missed Blocks Alert*\n\n%s has missed *%d* blocks.", name, currentMissedBlocks))
+		newLevel = "normal"
+
+	case level != "":
+		alerts = append(alerts, fmt.Sprintf("🟢 *Recovering*\n\n%s is back to normal, missed blocks: *%d*.", name, currentMissedBlocks))
+		newLevel = ""
+	}
+
+	return alerts, newLevel
 }
 
 // CheckValidator inspects a validator's signing info and returns the alerts to send
@@ -661,14 +611,9 @@ func CheckValidator(validator string) []string {
 	previousMissedBlocks, hasPrevious := validatorsMissedBlocks[validator]
 	level := validatorAlertLevels[validator]
 
-	missedAlerts, newLevel, newEpisodeMissed, newStreak := decideMissedBlocksAlert(
-		name, currentMissedBlocks, window, hasPrevious, previousMissedBlocks, level,
-		validatorEpisodeMissed[validator], validatorStreak[validator],
-	)
+	missedAlerts, newLevel := decideMissedBlocksAlert(name, currentMissedBlocks, window, hasPrevious, previousMissedBlocks, level)
 	alerts = append(alerts, missedAlerts...)
 	validatorAlertLevels[validator] = newLevel
-	validatorEpisodeMissed[validator] = newEpisodeMissed
-	validatorStreak[validator] = newStreak
 	validatorsMissedBlocks[validator] = currentMissedBlocks
 	for i := range alerts {
 		alerts[i] = withMintscanLink(alerts[i], validator)
@@ -726,10 +671,8 @@ func saveValidatorState() {
 	defer stateMu.Unlock()
 	saveJSONFile(config.ValidatorsFile, validatorsMissedBlocks)
 	saveJSONFile(config.StateFile, BotState{
-		AlertLevels:   validatorAlertLevels,
-		Jailed:        validatorJailed,
-		EpisodeMissed: validatorEpisodeMissed,
-		Streak:        validatorStreak,
+		AlertLevels: validatorAlertLevels,
+		Jailed:      validatorJailed,
 	})
 }
 

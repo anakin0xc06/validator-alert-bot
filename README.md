@@ -1,15 +1,15 @@
 # validator-alert-bot
 
-Telegram bot that watches Cosmos-SDK validators and alerts subscribers about missed blocks, jailing events and slashing risk.
+Telegram bot that watches Cosmos-SDK validators and alerts subscribers about missed blocks, uptime drops and jailing events.
 
 ## Features
 
-- Checks every subscribed validator's signing info every **5 minutes**
-- Graded missed-block alerts, tracked as a cumulative "episode" per validator rather than a single last-check-vs-now delta:
-  - 🟡 **Yellow** — ≥ 20 missed blocks total in the current missing episode
-  - 🔴 **Critical** — episode total reaches ≥ 100 missed blocks, or the validator missed blocks in 2 consecutive checks in a row (catches a sustained problem even below the 100 threshold)
-  - 🚨 **Critical (slashing risk)** — missing more than 50% of the network's slashing window
-  - 🟢 **Recovering** — missed-block counter drops by ≥ 50 since the last check (a small dip doesn't clear the alert — the counter naturally drifts down as old misses age out of the window)
+- Checks every subscribed validator's signing info every **10 minutes**
+- Missed-block alerts based on the validator's total (raw) missed-blocks counter:
+  - 🟡 **Missed Blocks Alert** — missed blocks total > 50
+  - 🔴 **Critical** — missed blocks total ≥ 150
+  - 📉 **Uptime Dropping** — fires independently whenever slashing-window uptime % drops by ≥ 1 percentage point versus the last check
+  - 🟢 **Recovering** — missed blocks drops back to ≤ 50 after having alerted
 - 🚨 Jailing / tombstoning alerts and ✅ unjail notices
 - 💚 Health ping every **6 hours** with a per-validator status summary, so you know the bot itself is alive
 - ⏰ Chain-upgrade watcher: tracks governance software-upgrade proposals per network — from voting period through passed — and warns **1 day** and **1-2 hours** before the estimated upgrade time (see below)

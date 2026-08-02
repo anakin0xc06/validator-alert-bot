@@ -27,18 +27,16 @@ func envOrDefault(key, def string) string {
 }
 
 const (
-	// YellowMissedBlocksLimit cumulative missed blocks in the current missing episode that triggers a yellow alert
-	YellowMissedBlocksLimit = 20
-	// CriticalMissedBlocksLimit cumulative missed blocks in the current missing episode that triggers a critical alert
-	CriticalMissedBlocksLimit = 100
-	// CriticalConsecutiveChecks consecutive checks at/above YellowMissedBlocksLimit that force escalation to critical
-	CriticalConsecutiveChecks = 2
-	// RecoveryMissedBlocksDrop the missed-blocks counter must drop by at least this much since the previous check before a recovery alert fires
-	RecoveryMissedBlocksDrop = 50
+	// MissedBlocksAlertLimit total missed blocks (the raw chain counter) above which a normal alert fires
+	MissedBlocksAlertLimit = 50
+	// MissedBlocksCriticalLimit total missed blocks above which a critical alert fires
+	MissedBlocksCriticalLimit = 150
+	// UptimeDropAlertPercent alert when the slashing-window uptime % drops by at least this many percentage points since the last check
+	UptimeDropAlertPercent = 1.0
 	// CriticalWindowPercent missed percentage of the slashing window that triggers a critical alert
 	CriticalWindowPercent = 50
 	// CheckIntervalSeconds how often validators are checked for missed blocks
-	CheckIntervalSeconds = 300
+	CheckIntervalSeconds = 600
 	// HealthCheckIntervalHours how often the bot reports that it is alive
 	HealthCheckIntervalHours = 6
 	// UpgradeCheckIntervalSeconds how often the bot polls governance proposals and block heights for scheduled upgrades
