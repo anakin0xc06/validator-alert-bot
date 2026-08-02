@@ -11,4 +11,5 @@ WORKDIR /app
 COPY --from=builder /app/validator-alert-bot .
 COPY config ./config
 VOLUME /app/data
+EXPOSE 8080
 CMD ["./validator-alert-bot"]

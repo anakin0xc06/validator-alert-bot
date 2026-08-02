@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,7 +29,9 @@ var (
 	validatorsMissedBlocks = make(map[string]int64)
 	validatorAlertLevels   = make(map[string]string)
 	validatorJailed        = make(map[string]bool)
-	signedBlocksWindows    = make(map[string]int64)
+	slashingParamsCache    = make(map[string]slashingParamsEntry)
+	validatorEpisodeMissed = make(map[string]int64)
+	validatorStreak        = make(map[string]int64)
 
 	// read-only after initBot
 	networks         = make(map[string]map[string]string)
@@ -45,8 +48,10 @@ type ValidatorAlias struct {
 // BotState is the alert state persisted across restarts so the bot does not
 // re-send jail/level alerts after a redeploy
 type BotState struct {
-	AlertLevels map[string]string `json:"alert_levels"`
-	Jailed      map[string]bool   `json:"jailed"`
+	AlertLevels   map[string]string `json:"alert_levels"`
+	Jailed        map[string]bool   `json:"jailed"`
+	EpisodeMissed map[string]int64  `json:"episode_missed"`
+	Streak        map[string]int64  `json:"streak"`
 }
 
 func loadJSONFile(path string, v interface{}, required bool) {
@@ -93,6 +98,12 @@ func initBot() {
 	if state.Jailed != nil {
 		validatorJailed = state.Jailed
 	}
+	if state.EpisodeMissed != nil {
+		validatorEpisodeMissed = state.EpisodeMissed
+	}
+	if state.Streak != nil {
+		validatorStreak = state.Streak
+	}
 
 	var aliases []ValidatorAlias
 	loadJSONFile(config.ValidatorAliasesFile, &aliases, false)
@@ -114,6 +125,7 @@ func main() {
 	}
 	initBot()
 	go SubscribersHandleScheduler(bot)
+	go StartWebServer()
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 
@@ -149,6 +161,7 @@ Commands (work in groups as well as DMs):
 /subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, jailing and slashing-risk alerts. Alerts are always DM'd to you directly, so message me privately at least once or they won't arrive.
 /unsubscribe — remove all your subscriptions
 /uptime — signing window, missed blocks and uptime of your validators
+/dashboard — uptime and safety for every validator configured in validator_aliases.json
 /upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA
 /help — show this help
 
@@ -176,6 +189,8 @@ func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		HandleUnsubscribe(bot, update)
 	case "uptime":
 		HandleUptime(bot, update)
+	case "dashboard":
+		HandleDashboard(bot, update)
 	case "upgrades":
 		HandleUpgradesCommand(bot, update)
 	default:
@@ -295,6 +310,172 @@ func HandleUptime(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	helpers.SendMessage(bot, update, sb.String(), tgbotapi.ModeMarkdown)
 }
 
+// validatorSafetyStatus turns a signing-info reading into an uptime % and a
+// safe/unsafe verdict based on the chain's real min_signed_per_window
+// slashing param, rather than the flat config.CriticalWindowPercent used
+// elsewhere. Falls back to config.CriticalWindowPercent when
+// minSignedPerWindow is unavailable (e.g. the params fetch failed) so the
+// dashboard still shows a meaningful verdict instead of always "safe".
+func validatorSafetyStatus(missed, window int64, minSignedPerWindow float64, jailed bool) (uptimePct float64, safe bool) {
+	uptimePct = float64(window-missed) * 100 / float64(window)
+	threshold := 100 - float64(config.CriticalWindowPercent)
+	if minSignedPerWindow > 0 {
+		threshold = minSignedPerWindow * 100
+	}
+	safe = !jailed && uptimePct >= threshold
+	return uptimePct, safe
+}
+
+// splitMessage breaks text into chunks no larger than limit, splitting only
+// on line boundaries, so long dashboards stay under Telegram's 4096-char
+// message cap without cutting a validator's entry in half.
+func splitMessage(text string, limit int) []string {
+	hadTrailingNewline := strings.HasSuffix(text, "\n")
+	lines := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
+	var chunks []string
+	var cur strings.Builder
+	for i, line := range lines {
+		addition := line
+		if i < len(lines)-1 || hadTrailingNewline {
+			addition += "\n"
+		}
+		if cur.Len() > 0 && cur.Len()+len(addition) > limit {
+			chunks = append(chunks, cur.String())
+			cur.Reset()
+		}
+		cur.WriteString(addition)
+	}
+	if cur.Len() > 0 {
+		chunks = append(chunks, cur.String())
+	}
+	return chunks
+}
+
+// HandleDashboard reports slashing-window uptime and safety for every
+// validator configured in validator_aliases.json (not just the caller's own
+// subscriptions), grouped by network. Safety is based on the chain's real
+// min_signed_per_window rather than the flat threshold /uptime uses.
+func HandleDashboard(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
+	if len(validatorAliases) == 0 {
+		helpers.SendMessage(bot, update, "No validators configured in validator_aliases.json.", tgbotapi.ModeMarkdown)
+		return
+	}
+	for _, chunk := range buildDashboardMessages() {
+		helpers.SendMessage(bot, update, chunk, tgbotapi.ModeMarkdown)
+	}
+}
+
+// dashboardRow is one validator's worth of data for the /dashboard command
+// and the web dashboard. Note is set instead of the numeric/status fields
+// when the row's data couldn't be fetched (e.g. "network not supported").
+type dashboardRow struct {
+	Network      string
+	Moniker      string
+	Missed       int64
+	Window       int64
+	UptimePct    float64
+	Safe         bool
+	Jailed       bool
+	MintscanLink string
+	Note         string
+}
+
+// collectDashboardRows fetches signing info for every validator configured
+// in validator_aliases.json and returns one row per validator, sorted by
+// (network, moniker). Shared by the /dashboard Telegram command and the web
+// dashboard so both report from a single fetch/compute path.
+func collectDashboardRows() []dashboardRow {
+	type entry struct {
+		address string
+		alias   ValidatorAlias
+	}
+	entries := make([]entry, 0, len(validatorAliases))
+	for address, alias := range validatorAliases {
+		entries = append(entries, entry{address: address, alias: alias})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].alias.Network != entries[j].alias.Network {
+			return entries[i].alias.Network < entries[j].alias.Network
+		}
+		return entries[i].alias.Moniker < entries[j].alias.Moniker
+	})
+
+	rows := make([]dashboardRow, 0, len(entries))
+	for _, e := range entries {
+		moniker := e.alias.Moniker
+		if moniker == "" {
+			moniker = e.address
+		}
+		row := dashboardRow{Network: e.alias.Network, Moniker: moniker, MintscanLink: mintscanLink(e.address)}
+
+		prefix := getPrefix(e.address)
+		if len(prefix) == 0 || len(networks[prefix]) == 0 {
+			row.Note = "network not supported"
+			rows = append(rows, row)
+			continue
+		}
+		info, err := helpers.GetSigningInfo(networks[prefix]["rest"], e.address)
+		if err != nil {
+			row.Note = "failed to fetch signing info"
+			rows = append(rows, row)
+			continue
+		}
+		missed, err := strconv.ParseInt(info.MissedBlocksCounter, 10, 64)
+		if err != nil {
+			row.Note = "failed to fetch signing info"
+			rows = append(rows, row)
+			continue
+		}
+		params := getSlashingParamsCached(prefix)
+		if params.Window <= 0 {
+			row.Missed = missed
+			row.Note = "slashing window unavailable"
+			rows = append(rows, row)
+			continue
+		}
+		jailed := info.Tombstoned || info.JailedUntil.After(time.Now().UTC())
+		uptime, safe := validatorSafetyStatus(missed, params.Window, params.MinSignedPerWindow, jailed)
+		row.Missed = missed
+		row.Window = params.Window
+		row.UptimePct = uptime
+		row.Safe = safe
+		row.Jailed = jailed
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// buildDashboardMessages renders collectDashboardRows as Telegram markdown,
+// split into Telegram-sized chunks.
+func buildDashboardMessages() []string {
+	var sb strings.Builder
+	sb.WriteString("📊 *Validator Dashboard*\n")
+	currentNetwork := ""
+	for _, row := range collectDashboardRows() {
+		if row.Network != currentNetwork {
+			sb.WriteString(fmt.Sprintf("\n*%s*\n", row.Network))
+			currentNetwork = row.Network
+		}
+		if row.Note != "" {
+			sb.WriteString(fmt.Sprintf("⚪️ %s — %s\n", row.Moniker, row.Note))
+			continue
+		}
+		dot, status := "🟢", "SAFE"
+		if !row.Safe {
+			dot, status = "🔴", "UNSAFE"
+		}
+		if row.Jailed {
+			status += " (jailed)"
+		}
+		sb.WriteString(fmt.Sprintf("%s %s — missed %d/%d, uptime %.2f%% — *%s*\n", dot, row.Moniker, row.Missed, row.Window, row.UptimePct, status))
+		if row.MintscanLink != "" {
+			sb.WriteString(fmt.Sprintf("   🔗 [Mintscan](%s)\n", row.MintscanLink))
+		}
+	}
+
+	return splitMessage(sb.String(), 3500)
+}
+
 func getPrefix(addr string) string {
 	parts := strings.Split(addr, "val")
 	if len(parts) > 1 {
@@ -336,22 +517,108 @@ func withMintscanLink(text, validator string) string {
 	return text
 }
 
-func getSignedBlocksWindow(prefix string) int64 {
+// slashingParamsEntry caches a network's slashing window size and the
+// minimum fraction of it that must be signed to avoid being jailed
+type slashingParamsEntry struct {
+	Window             int64
+	MinSignedPerWindow float64
+}
+
+func getSlashingParamsCached(prefix string) slashingParamsEntry {
 	stateMu.Lock()
-	window, ok := signedBlocksWindows[prefix]
+	entry, ok := slashingParamsCache[prefix]
 	stateMu.Unlock()
 	if ok {
-		return window
+		return entry
 	}
-	window, err := helpers.GetSignedBlocksWindow(networks[prefix]["rest"])
+	window, minSignedPerWindow, err := helpers.GetSlashingParams(networks[prefix]["rest"])
 	if err != nil {
 		log.Printf("Failed to fetch slashing params for %s: %v", prefix, err)
-		return 0
+		return slashingParamsEntry{}
 	}
+	entry = slashingParamsEntry{Window: window, MinSignedPerWindow: minSignedPerWindow}
 	stateMu.Lock()
-	signedBlocksWindows[prefix] = window
+	slashingParamsCache[prefix] = entry
 	stateMu.Unlock()
-	return window
+	return entry
+}
+
+func getSignedBlocksWindow(prefix string) int64 {
+	return getSlashingParamsCached(prefix).Window
+}
+
+// decideMissedBlocksAlert is the pure decision logic behind CheckValidator's
+// missed-blocks alerting. It tracks missed blocks as a cumulative "episode"
+// (episodeMissed) plus a consecutive-checks streak instead of judging each
+// check against only the previous one, so a validator that keeps missing a
+// moderate number of blocks check after check still gets escalated, and
+// "recovering" only fires on a real, large drop rather than sliding-window
+// noise. It touches no global state so it can be tested without a network
+// call.
+func decideMissedBlocksAlert(name string, currentMissedBlocks, window int64, hasPrevious bool, previousMissedBlocks int64, level string, episodeMissed, streak int64) (alerts []string, newLevel string, newEpisodeMissed, newStreak int64) {
+	delta := currentMissedBlocks - previousMissedBlocks
+	interval := config.CheckIntervalSeconds / 60
+
+	var uptimePct float64
+	if window > 0 {
+		uptimePct = float64(window-currentMissedBlocks) * 100 / float64(window)
+	}
+
+	newEpisodeMissed = episodeMissed
+	if hasPrevious && delta > 0 {
+		newEpisodeMissed += delta
+	}
+
+	if hasPrevious && delta >= config.YellowMissedBlocksLimit {
+		newStreak = streak + 1
+	} else {
+		newStreak = 0
+	}
+
+	escalate := newEpisodeMissed >= config.CriticalMissedBlocksLimit || newStreak >= config.CriticalConsecutiveChecks
+	newLevel = level
+
+	switch {
+	case window > 0 && currentMissedBlocks*100 >= window*config.CriticalWindowPercent:
+		if level != "critical" || currentMissedBlocks > previousMissedBlocks {
+			alerts = append(alerts, fmt.Sprintf("🚨 *CRITICAL: Slashing Risk*\n\n%s is missing *%d* of the last *%d* blocks (%.1f%% of the slashing window) and is at risk of being jailed and slashed.", name, currentMissedBlocks, window, float64(currentMissedBlocks)*100/float64(window)))
+		}
+		newLevel = "critical"
+
+	// Checked before the episode-based cases below: a real, large drop is
+	// strong enough evidence of recovery that it should clear the episode
+	// even if the historical episodeMissed/streak totals are still high.
+	// Otherwise episodeMissed only ever resets inside this case, so once it
+	// crosses the yellow/critical thresholds the cases below would always
+	// match first and recovery could never be reached.
+	case hasPrevious && level != "" && previousMissedBlocks-currentMissedBlocks >= config.RecoveryMissedBlocksDrop:
+		suffix := ""
+		if window > 0 {
+			suffix = fmt.Sprintf(" Window uptime back up to *%.2f%%*.", uptimePct)
+		}
+		alerts = append(alerts, fmt.Sprintf("🟢 *Recovering*\n\n%s is signing again, missed blocks decreasing: *%d → %d*.%s", name, previousMissedBlocks, currentMissedBlocks, suffix))
+		newLevel = ""
+		newEpisodeMissed = 0
+		newStreak = 0
+
+	case hasPrevious && escalate:
+		suffix := ""
+		if window > 0 {
+			suffix = fmt.Sprintf(" Window uptime: *%.2f%%*.", uptimePct)
+		}
+		alerts = append(alerts, fmt.Sprintf("🔴 *CRITICAL: Missing Blocks*\n\n%s has missed *%d* blocks overall in the current episode (%d → %d, +%d in the last %d minutes).%s This looks like a sustained problem — please check the node immediately.", name, newEpisodeMissed, previousMissedBlocks, currentMissedBlocks, delta, interval, suffix))
+		newLevel = "critical"
+
+	case hasPrevious && newEpisodeMissed >= config.YellowMissedBlocksLimit:
+		suffix := ""
+		if window > 0 {
+			suffix = fmt.Sprintf(" Window uptime: *%.2f%%*.", uptimePct)
+		}
+		alerts = append(alerts, fmt.Sprintf("🟡 *Missed Blocks Alert*\n\n%s is missing blocks: *%d → %d* (+%d in the last %d minutes, %d missed overall in this episode).%s", name, previousMissedBlocks, currentMissedBlocks, delta, interval, newEpisodeMissed, suffix))
+		newLevel = "yellow"
+	}
+
+	return alerts, newLevel, newEpisodeMissed, newStreak
 }
 
 // CheckValidator inspects a validator's signing info and returns the alerts to send
@@ -392,28 +659,16 @@ func CheckValidator(validator string) []string {
 	validatorJailed[validator] = jailedNow
 
 	previousMissedBlocks, hasPrevious := validatorsMissedBlocks[validator]
-	delta := currentMissedBlocks - previousMissedBlocks
 	level := validatorAlertLevels[validator]
-	interval := config.CheckIntervalSeconds / 60
 
-	switch {
-	case window > 0 && currentMissedBlocks*100 >= window*config.CriticalWindowPercent:
-		if level != "critical" || currentMissedBlocks > previousMissedBlocks {
-			percent := float64(currentMissedBlocks) * 100 / float64(window)
-			alerts = append(alerts, fmt.Sprintf("🚨 *CRITICAL: Slashing Risk*\n\n%s is missing *%d* of the last *%d* blocks (%.1f%% of the slashing window) and is at risk of being jailed and slashed.", name, currentMissedBlocks, window, percent))
-		}
-		validatorAlertLevels[validator] = "critical"
-	case hasPrevious && delta >= config.RedMissedBlocksLimit:
-		alerts = append(alerts, fmt.Sprintf("🔴 *High Missed Blocks Alert*\n\n%s is missing a lot of blocks: *%d → %d* (+%d in the last %d minutes). Please check the node immediately.", name, previousMissedBlocks, currentMissedBlocks, delta, interval))
-		validatorAlertLevels[validator] = "red"
-	case hasPrevious && delta >= config.MissedBlocksLimit:
-		alerts = append(alerts, fmt.Sprintf("🟡 *Missed Blocks Alert*\n\n%s is missing blocks: *%d → %d* (+%d in the last %d minutes).", name, previousMissedBlocks, currentMissedBlocks, delta, interval))
-		validatorAlertLevels[validator] = "yellow"
-	case hasPrevious && currentMissedBlocks < previousMissedBlocks && level != "":
-		alerts = append(alerts, fmt.Sprintf("🟢 *Recovering*\n\n%s is signing again, missed blocks decreasing: *%d → %d*.", name, previousMissedBlocks, currentMissedBlocks))
-		validatorAlertLevels[validator] = ""
-	}
-
+	missedAlerts, newLevel, newEpisodeMissed, newStreak := decideMissedBlocksAlert(
+		name, currentMissedBlocks, window, hasPrevious, previousMissedBlocks, level,
+		validatorEpisodeMissed[validator], validatorStreak[validator],
+	)
+	alerts = append(alerts, missedAlerts...)
+	validatorAlertLevels[validator] = newLevel
+	validatorEpisodeMissed[validator] = newEpisodeMissed
+	validatorStreak[validator] = newStreak
 	validatorsMissedBlocks[validator] = currentMissedBlocks
 	for i := range alerts {
 		alerts[i] = withMintscanLink(alerts[i], validator)
@@ -470,7 +725,12 @@ func saveValidatorState() {
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	saveJSONFile(config.ValidatorsFile, validatorsMissedBlocks)
-	saveJSONFile(config.StateFile, BotState{AlertLevels: validatorAlertLevels, Jailed: validatorJailed})
+	saveJSONFile(config.StateFile, BotState{
+		AlertLevels:   validatorAlertLevels,
+		Jailed:        validatorJailed,
+		EpisodeMissed: validatorEpisodeMissed,
+		Streak:        validatorStreak,
+	})
 }
 
 // SendHealthCheck tells every subscriber the bot is alive and summarizes their validators

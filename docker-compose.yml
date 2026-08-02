@@ -5,6 +5,11 @@ services:
     restart: unless-stopped
     environment:
       - BOT_API_KEY=${BOT_API_KEY}
+      # optional: set both to enable the web dashboard (disabled without them)
+      - WEB_USERNAME=${WEB_USERNAME:-}
+      - WEB_PASSWORD=${WEB_PASSWORD:-}
+    ports:
+      - "${WEB_PORT:-8080}:8080"
     volumes:
       - ./data:/app/data
       # mount config so networks/aliases can be changed without rebuilding

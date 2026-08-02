@@ -194,23 +194,40 @@ func CheckMissedBlocks(restApi, validatorConsAddress string) (int64, error) {
 	return missedBlocks, nil
 }
 
-// GetSignedBlocksWindow fetches the slashing window size of a network
-func GetSignedBlocksWindow(restApi string) (int64, error) {
+// GetSlashingParams fetches the slashing window size and the minimum
+// fraction of it that must be signed to avoid being jailed
+// (min_signed_per_window, e.g. 0.05 for 5%)
+func GetSlashingParams(restApi string) (window int64, minSignedPerWindow float64, err error) {
 	url := restApi + "/cosmos/slashing/v1beta1/params"
 	resp, err := httpClient.Get(url)
 	if err != nil {
 		log.Printf("Request to %s failed: %v", url, err)
-		return 0, err
+		return 0, 0, err
 	}
 	defer resp.Body.Close()
 	var body SlashingParamsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	if resp.StatusCode == http.StatusOK {
-		return strconv.ParseInt(body.Params.SignedBlocksWindow, 10, 64)
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("unable to get slashing params: %s", resp.Status)
 	}
-	return 0, fmt.Errorf("unable to get slashing params: %s", resp.Status)
+	window, err = strconv.ParseInt(body.Params.SignedBlocksWindow, 10, 64)
+	if err != nil {
+		return 0, 0, err
+	}
+	minSignedPerWindow, err = strconv.ParseFloat(body.Params.MinSignedPerWindow, 64)
+	if err != nil {
+		log.Printf("Bad min_signed_per_window %q from %s: %v", body.Params.MinSignedPerWindow, restApi, err)
+		return window, 0, nil
+	}
+	return window, minSignedPerWindow, nil
+}
+
+// GetSignedBlocksWindow fetches the slashing window size of a network
+func GetSignedBlocksWindow(restApi string) (int64, error) {
+	window, _, err := GetSlashingParams(restApi)
+	return window, err
 }
 
 // ChainUpgradePlan is a scheduled x/upgrade plan discovered either through a
