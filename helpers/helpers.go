@@ -13,12 +13,29 @@ import (
 	tgbotapi "gopkg.in/telegram-bot-api.v4"
 )
 
+// userAgentTransport sets a descriptive User-Agent on every outgoing
+// request. Some public RPC/REST providers deprioritize or throttle the
+// default Go-http-client UA, so this is cheap insurance against that.
+type userAgentTransport struct {
+	base      http.RoundTripper
+	userAgent string
+}
+
+func (t *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	req.Header.Set("User-Agent", t.userAgent)
+	return t.base.RoundTrip(req)
+}
+
 // httpClient is a dedicated client with a timeout so a stuck REST endpoint
 // cannot hang a whole check cycle
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	Transport: &userAgentTransport{
+		base: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		userAgent: "validator-alert-bot/1.0 (+https://github.com/anakin0xc06/validator-alert-bot)",
 	},
 }
 
