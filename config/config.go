@@ -27,11 +27,13 @@ func envOrDefault(key, def string) string {
 }
 
 const (
-	// MissedBlocksAlertLimit total missed blocks (the raw chain counter) above which a normal alert fires
-	MissedBlocksAlertLimit = 50
-	// MissedBlocksCriticalLimit total missed blocks above which a critical alert fires
-	MissedBlocksCriticalLimit = 150
-	// UptimeDropAlertPercent alert when the slashing-window uptime % drops by at least this many percentage points since the last check
+	// NormalMissedBlocksDelta missed-blocks increase in a single check that triggers a normal alert (up to CriticalMissedBlocksDelta)
+	NormalMissedBlocksDelta = 50
+	// CriticalMissedBlocksDelta missed-blocks increase in a single check above which the alert is critical
+	CriticalMissedBlocksDelta = 100
+	// CriticalUptimePercent window uptime percentage below which an alert is always critical, regardless of delta
+	CriticalUptimePercent = 80.0
+	// UptimeDropAlertPercent minimum uptime percentage-point drop since the last check that triggers a normal alert
 	UptimeDropAlertPercent = 1.0
 	// CriticalWindowPercent missed percentage of the slashing window that triggers a critical alert
 	CriticalWindowPercent = 50

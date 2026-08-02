@@ -68,28 +68,96 @@ func TestSplitMessage_ShortTextIsSingleChunk(t *testing.T) {
 	}
 }
 
-func TestDecideMissedBlocksAlert_BelowNormalLimitNoAlert(t *testing.T) {
-	alerts, level := decideMissedBlocksAlert("val", 50, 0, true, 40, "")
-	if level != "" {
-		t.Fatalf("expected no level, got %q", level)
+// Regression test for a real production report: a validator sat around
+// ~2700-2760 missed blocks (out of a 108000 window, ~97.5% uptime) while
+// the count was actually *decreasing* check over check, but the old
+// absolute-threshold logic (missed >= 150) kept re-firing a critical alert
+// every single check regardless of trend. With delta/threshold-based
+// logic, a shrinking count on an already-healthy window should be silent.
+func TestDecideMissedBlocksAlert_ShrinkingMissedBlocksOnHealthyWindowDoesNotRepeatCritical(t *testing.T) {
+	alerts, level := decideMissedBlocksAlert("Citadel.one (sei)", 2702, 108000, true, 2760, "critical")
+	for _, a := range alerts {
+		if strings.Contains(a, "CRITICAL") {
+			t.Fatalf("did not expect a(nother) critical alert while missed blocks shrink on an otherwise-healthy window, got %v", alerts)
+		}
 	}
-	if len(alerts) != 0 {
-		t.Fatalf("expected no alert at exactly the normal limit (not exceeding it), got %v", alerts)
+	// Neither the critical nor normal conditions hold anymore, so at most a
+	// single one-off recovery message is acceptable (clearing the level) —
+	// what must NOT happen is another repeat of the critical alert.
+	if len(alerts) > 1 {
+		t.Fatalf("expected at most one alert (a recovery message), got %v", alerts)
+	}
+	if level != "" {
+		t.Fatalf("expected level to clear once neither condition holds, got %q", level)
 	}
 }
 
-func TestDecideMissedBlocksAlert_AboveNormalLimitAlertsNormal(t *testing.T) {
-	alerts, level := decideMissedBlocksAlert("val", 51, 0, true, 40, "")
+func TestDecideMissedBlocksAlert_DeltaOverCriticalThresholdIsCritical(t *testing.T) {
+	// delta = 250 - 40 = 210, over the 100 critical threshold
+	alerts, level := decideMissedBlocksAlert("val", 250, 0, true, 40, "")
+	if level != "critical" {
+		t.Fatalf("expected level=critical, got %q", level)
+	}
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "CRITICAL: Missing Blocks") {
+		t.Fatalf("expected a critical alert, got %v", alerts)
+	}
+	if !strings.Contains(alerts[0], "increased by 210") {
+		t.Fatalf("expected the alert to explain the delta, got %v", alerts[0])
+	}
+}
+
+func TestDecideMissedBlocksAlert_DeltaExactlyAtCriticalThresholdIsNormalNotCritical(t *testing.T) {
+	// "critical if increased over 100" -> exactly 100 is NOT over 100
+	alerts, level := decideMissedBlocksAlert("val", 140, 0, true, 40, "")
+	if level != "normal" {
+		t.Fatalf("expected level=normal at exactly the boundary, got %q", level)
+	}
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "Missed Blocks Alert") {
+		t.Fatalf("expected a normal alert, got %v", alerts)
+	}
+}
+
+func TestDecideMissedBlocksAlert_DeltaInNormalRangeIsNormal(t *testing.T) {
+	// delta = 70, within the 50-100 normal range
+	alerts, level := decideMissedBlocksAlert("val", 110, 0, true, 40, "")
 	if level != "normal" {
 		t.Fatalf("expected level=normal, got %q", level)
 	}
 	if len(alerts) != 1 || !strings.Contains(alerts[0], "Missed Blocks Alert") {
-		t.Fatalf("expected a normal missed-blocks alert, got %v", alerts)
+		t.Fatalf("expected a normal alert, got %v", alerts)
 	}
 }
 
-func TestDecideMissedBlocksAlert_AtOrAboveCriticalLimitAlertsCritical(t *testing.T) {
-	alerts, level := decideMissedBlocksAlert("val", 150, 0, true, 100, "normal")
+func TestDecideMissedBlocksAlert_DeltaBelowNormalRangeStaysSilent(t *testing.T) {
+	// delta = 30, under the 50 floor, and uptime unavailable (window=0)
+	alerts, level := decideMissedBlocksAlert("val", 70, 0, true, 40, "")
+	if len(alerts) != 0 {
+		t.Fatalf("expected no alert for a small delta with no uptime signal, got %v", alerts)
+	}
+	if level != "" {
+		t.Fatalf("expected no level, got %q", level)
+	}
+}
+
+func TestDecideMissedBlocksAlert_AbsoluteUptimeBelow80IsCriticalRegardlessOfDelta(t *testing.T) {
+	// window=1000, missed=250 -> uptime=75%, below the 80% critical floor,
+	// even though the delta itself (10) is tiny
+	alerts, level := decideMissedBlocksAlert("val", 250, 1000, true, 240, "")
+	if level != "critical" {
+		t.Fatalf("expected level=critical, got %q", level)
+	}
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "CRITICAL: Missing Blocks") {
+		t.Fatalf("expected a critical alert, got %v", alerts)
+	}
+	if !strings.Contains(alerts[0], "uptime is below 80%") {
+		t.Fatalf("expected the alert to explain the uptime reason, got %v", alerts[0])
+	}
+}
+
+func TestDecideMissedBlocksAlert_AbsoluteUptimeCriticalFiresOnFirstCheckEvenWithoutPrevious(t *testing.T) {
+	// A validator discovered already deep in trouble should be flagged
+	// immediately, not wait for a second reading to establish a delta.
+	alerts, level := decideMissedBlocksAlert("val", 500, 1000, false, 0, "")
 	if level != "critical" {
 		t.Fatalf("expected level=critical, got %q", level)
 	}
@@ -98,20 +166,34 @@ func TestDecideMissedBlocksAlert_AtOrAboveCriticalLimitAlertsCritical(t *testing
 	}
 }
 
-func TestDecideMissedBlocksAlert_RepeatsEveryCheckWhileAboveThreshold(t *testing.T) {
-	// No de-dup: as long as missed blocks stays above the threshold, the
-	// alert should fire again on the next check too.
-	alerts, level := decideMissedBlocksAlert("val", 200, 0, true, 200, "critical")
-	if level != "critical" {
-		t.Fatalf("expected level to remain critical, got %q", level)
+func TestDecideMissedBlocksAlert_UptimeDropTriggersNormalAlert(t *testing.T) {
+	// window=3000, delta=35 (well under the 50 delta floor, so the delta
+	// condition alone would stay silent): previous uptime 99.67% -> current
+	// uptime 98.50%, a ~1.17-point drop, above the 1.0-point threshold.
+	alerts, level := decideMissedBlocksAlert("val", 45, 3000, true, 10, "")
+	if level != "normal" {
+		t.Fatalf("expected level=normal, got %q", level)
 	}
-	if len(alerts) != 1 || !strings.Contains(alerts[0], "CRITICAL: Missing Blocks") {
-		t.Fatalf("expected the critical alert to repeat, got %v", alerts)
+	if len(alerts) != 1 || !strings.Contains(alerts[0], "Uptime dropped 1.17 points") {
+		t.Fatalf("expected the alert to explain the uptime drop, got %v", alerts)
 	}
 }
 
-func TestDecideMissedBlocksAlert_DropBackBelowNormalLimitRecovers(t *testing.T) {
-	alerts, level := decideMissedBlocksAlert("val", 30, 0, true, 60, "normal")
+func TestDecideMissedBlocksAlert_SmallUptimeDropAndSmallDeltaStaysSilent(t *testing.T) {
+	// window=10000: previous uptime 99.50% -> current uptime 99.10%, a
+	// 0.4-point drop, below the 1.0-point threshold; delta=40 is also under
+	// the 50 floor.
+	alerts, level := decideMissedBlocksAlert("val", 90, 10000, true, 50, "")
+	if len(alerts) != 0 {
+		t.Fatalf("expected no alert for a sub-threshold uptime drop and delta, got %v", alerts)
+	}
+	if level != "" {
+		t.Fatalf("expected no level, got %q", level)
+	}
+}
+
+func TestDecideMissedBlocksAlert_RecoversWhenNoConditionHoldsAnymore(t *testing.T) {
+	alerts, level := decideMissedBlocksAlert("val", 42, 10000, true, 45, "normal")
 	if level != "" {
 		t.Fatalf("expected level to clear, got %q", level)
 	}
@@ -121,8 +203,6 @@ func TestDecideMissedBlocksAlert_DropBackBelowNormalLimitRecovers(t *testing.T) 
 }
 
 func TestDecideMissedBlocksAlert_NoRecoveryAlertWithoutPriorLevel(t *testing.T) {
-	// Never alerted before (level == ""), staying under the threshold should
-	// stay silent rather than firing a spurious "recovering" message.
 	alerts, level := decideMissedBlocksAlert("val", 10, 0, true, 5, "")
 	if level != "" {
 		t.Fatalf("expected no level, got %q", level)
@@ -132,37 +212,15 @@ func TestDecideMissedBlocksAlert_NoRecoveryAlertWithoutPriorLevel(t *testing.T) 
 	}
 }
 
-func TestDecideMissedBlocksAlert_UptimeDropFiresSeparateAlert(t *testing.T) {
-	// window=10000: previous uptime 99.50% -> current uptime 98.30%, a
-	// 1.2-point drop, above the 1.0-point threshold.
-	alerts, _ := decideMissedBlocksAlert("val", 170, 10000, true, 50, "")
-	found := false
-	for _, a := range alerts {
-		if strings.Contains(a, "Uptime Dropping") {
-			found = true
-		}
+func TestDecideMissedBlocksAlert_MessagesShowUptimeAndMissedCount(t *testing.T) {
+	alerts, _ := decideMissedBlocksAlert("val", 250, 1000, true, 40, "")
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %v", alerts)
 	}
-	if !found {
-		t.Fatalf("expected an uptime-drop alert, got %v", alerts)
+	if !strings.Contains(alerts[0], "Missed blocks: *250*") {
+		t.Fatalf("expected the message to show the current missed-blocks count, got %v", alerts[0])
 	}
-}
-
-func TestDecideMissedBlocksAlert_SmallUptimeDropDoesNotAlert(t *testing.T) {
-	// window=10000: previous uptime 99.50% -> current uptime 99.10%, a
-	// 0.4-point drop, below the 1.0-point threshold.
-	alerts, _ := decideMissedBlocksAlert("val", 90, 10000, true, 50, "")
-	for _, a := range alerts {
-		if strings.Contains(a, "Uptime Dropping") {
-			t.Fatalf("did not expect an uptime-drop alert for a sub-threshold drop, got %v", alerts)
-		}
-	}
-}
-
-func TestDecideMissedBlocksAlert_NoWindowSkipsUptimeDropCheck(t *testing.T) {
-	alerts, _ := decideMissedBlocksAlert("val", 90, 0, true, 5, "")
-	for _, a := range alerts {
-		if strings.Contains(a, "Uptime Dropping") {
-			t.Fatalf("did not expect an uptime-drop alert when window is unavailable, got %v", alerts)
-		}
+	if !strings.Contains(alerts[0], "Uptime: *75.00%*") {
+		t.Fatalf("expected the message to show the current uptime percentage, got %v", alerts[0])
 	}
 }

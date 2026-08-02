@@ -5,11 +5,16 @@ Telegram bot that watches Cosmos-SDK validators and alerts subscribers about mis
 ## Features
 
 - Checks every subscribed validator's signing info every **10 minutes**
-- Missed-block alerts based on the validator's total (raw) missed-blocks counter:
-  - 🟡 **Missed Blocks Alert** — missed blocks total > 50
-  - 🔴 **Critical** — missed blocks total ≥ 150
-  - 📉 **Uptime Dropping** — fires independently whenever slashing-window uptime % drops by ≥ 1 percentage point versus the last check
-  - 🟢 **Recovering** — missed blocks drops back to ≤ 50 after having alerted
+- Missed-block alerts are evaluated fresh each check against only the current and previous
+  reading — a validator whose missed-blocks counter is merely staying high while trending down
+  does not keep re-triggering the same alert; every message includes the current uptime % and
+  missed-blocks count:
+  - 🔴 **Critical** — missed blocks jumped by more than 100 in a single check, OR slashing-window
+    uptime is currently below 80% (this one can keep firing every check while uptime stays that low —
+    it's a real, ongoing risk, not a one-off event)
+  - 🟡 **Missed Blocks Alert** — slashing-window uptime dropped by ≥ 1 percentage point since the
+    last check, OR missed blocks increased by 50-100 in a single check
+  - 🟢 **Recovering** — was previously alerting, and neither condition above holds anymore
 - 🚨 Jailing / tombstoning alerts and ✅ unjail notices
 - 💚 Health ping every **6 hours** with a per-validator status summary, so you know the bot itself is alive
 - ⏰ Chain-upgrade watcher: tracks governance software-upgrade proposals per network — from voting period through passed — and warns **1 day** and **1-2 hours** before the estimated upgrade time (see below)
@@ -72,12 +77,13 @@ on regardless of who has subscribed. Without `config/validator_aliases.json` (or
 
 The bot can also serve the same report `/dashboard` shows as a small self-refreshing HTML page
 (no external CSS/JS, plain `net/http`), listing every validator in
-`config/validator_aliases.json` grouped by network with uptime % and 🟢/🔴 safety.
+`config/validator_aliases.json` in a single table (network as its own column) with an uptime
+bar and 🟢/🔴 safety per row.
 
 It's disabled by default and only starts if **both** `WEB_USERNAME` and `WEB_PASSWORD` are set —
-the page is gated behind HTTP Basic Auth using those credentials, since the process is otherwise
-happy to bind and serve to anyone who can reach the port. Set `WEB_LISTEN_ADDR` to change the
-listen address (default `:8080`).
+visiting the page prompts a login form (session cookie, 24h expiry) rather than a browser Basic
+Auth popup; `/logout` ends the session. Set `WEB_LISTEN_ADDR` to change the listen address
+(default `:8080`).
 
 ```sh
 export WEB_USERNAME=admin

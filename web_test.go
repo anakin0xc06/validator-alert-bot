@@ -3,87 +3,186 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/anakin0xc06/validator-alert-bot/config"
 )
 
-func TestRequireBasicAuth_RejectsMissingOrWrongCredentials(t *testing.T) {
-	called := false
-	handler := requireBasicAuth("admin", "secret", func(w http.ResponseWriter, r *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
+// withWebCredentials sets config.WebUsername/WebPassword for the duration
+// of the test, restoring the previous values afterward
+func withWebCredentials(t *testing.T, user, pass string) {
+	t.Helper()
+	prevUser, prevPass := config.WebUsername, config.WebPassword
+	config.WebUsername, config.WebPassword = user, pass
+	t.Cleanup(func() {
+		config.WebUsername, config.WebPassword = prevUser, prevPass
 	})
+}
 
-	cases := []struct {
-		name           string
-		setAuth        bool
-		user, password string
-	}{
-		{"no credentials", false, "", ""},
-		{"wrong username", true, "nope", "secret"},
-		{"wrong password", true, "admin", "nope"},
+func TestLoginHandler_GET_ShowsForm(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	rec := httptest.NewRecorder()
+	loginHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			called = false
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			if c.setAuth {
-				req.SetBasicAuth(c.user, c.password)
-			}
-			rec := httptest.NewRecorder()
-			handler(rec, req)
-			if rec.Code != http.StatusUnauthorized {
-				t.Fatalf("expected 401, got %d", rec.Code)
-			}
-			if rec.Header().Get("WWW-Authenticate") == "" {
-				t.Fatalf("expected WWW-Authenticate header on 401")
-			}
-			if called {
-				t.Fatalf("wrapped handler must not run when auth fails")
-			}
-		})
+	if !strings.Contains(rec.Body.String(), `action="/login"`) {
+		t.Fatalf("expected a login form in the response, got:\n%s", rec.Body.String())
 	}
 }
 
-func TestRequireBasicAuth_AllowsCorrectCredentials(t *testing.T) {
+func TestLoginHandler_GET_WithValidSessionRedirectsToDashboard(t *testing.T) {
+	token, err := createSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { deleteSession(token) })
+
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	rec := httptest.NewRecorder()
+	loginHandler(rec, req)
+
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
+		t.Fatalf("expected redirect to /, got status=%d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+}
+
+func TestLoginHandler_POST_WrongCredentialsRejected(t *testing.T) {
+	withWebCredentials(t, "admin", "secret")
+
+	form := url.Values{"username": {"admin"}, "password": {"wrong"}}
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	loginHandler(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Invalid username or password") {
+		t.Fatalf("expected an error message, got:\n%s", rec.Body.String())
+	}
+	if rec.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("did not expect a session cookie on failed login")
+	}
+}
+
+func TestLoginHandler_POST_CorrectCredentialsSetsSessionAndRedirects(t *testing.T) {
+	withWebCredentials(t, "admin", "secret")
+
+	form := url.Values{"username": {"admin"}, "password": {"secret"}}
+	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	loginHandler(rec, req)
+
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
+		t.Fatalf("expected redirect to /, got status=%d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	resp := rec.Result()
+	t.Cleanup(func() {
+		for _, c := range resp.Cookies() {
+			if c.Name == sessionCookieName {
+				deleteSession(c.Value)
+			}
+		}
+	})
+	found := false
+	for _, c := range resp.Cookies() {
+		if c.Name == sessionCookieName && c.Value != "" {
+			found = true
+			if !validSession(&http.Request{Header: http.Header{"Cookie": []string{c.Name + "=" + c.Value}}}) {
+				t.Fatalf("expected the issued session to be valid")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected a session cookie to be set")
+	}
+}
+
+func TestRequireSession_RedirectsWithoutValidSession(t *testing.T) {
 	called := false
-	handler := requireBasicAuth("admin", "secret", func(w http.ResponseWriter, r *http.Request) {
+	handler := requireSession(func(w http.ResponseWriter, r *http.Request) { called = true })
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
+		t.Fatalf("expected redirect to /login, got status=%d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	if called {
+		t.Fatalf("wrapped handler must not run without a valid session")
+	}
+}
+
+func TestRequireSession_AllowsValidSession(t *testing.T) {
+	token, err := createSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { deleteSession(token) })
+
+	called := false
+	handler := requireSession(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.SetBasicAuth("admin", "secret")
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
 	rec := httptest.NewRecorder()
 	handler(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
-	}
-	if !called {
-		t.Fatalf("expected wrapped handler to run with correct credentials")
+	if rec.Code != http.StatusOK || !called {
+		t.Fatalf("expected the wrapped handler to run, got status=%d called=%v", rec.Code, called)
 	}
 }
 
-func TestGroupDashboardRowsByNetwork(t *testing.T) {
-	rows := []dashboardRow{
-		{Network: "cosmos", Moniker: "a"},
-		{Network: "cosmos", Moniker: "b"},
-		{Network: "akash", Moniker: "c"},
+func TestValidSession_ExpiredSessionIsRejectedAndEvicted(t *testing.T) {
+	const token = "expired-test-token"
+	sessionsMu.Lock()
+	sessions[token] = time.Now().Add(-time.Minute)
+	sessionsMu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	if validSession(req) {
+		t.Fatalf("expected an expired session to be invalid")
 	}
-	groups := groupDashboardRowsByNetwork(rows)
-	if len(groups) != 2 {
-		t.Fatalf("expected 2 groups, got %d: %+v", len(groups), groups)
+	sessionsMu.Lock()
+	_, stillPresent := sessions[token]
+	sessionsMu.Unlock()
+	if stillPresent {
+		t.Fatalf("expected the expired session to be evicted from the store")
 	}
-	if groups[0].Name != "cosmos" || len(groups[0].Rows) != 2 {
-		t.Fatalf("expected cosmos group with 2 rows, got %+v", groups[0])
-	}
-	if groups[1].Name != "akash" || len(groups[1].Rows) != 1 {
-		t.Fatalf("expected akash group with 1 row, got %+v", groups[1])
+}
+
+func TestLogoutHandler_ClearsSessionAndRedirects(t *testing.T) {
+	token, err := createSession()
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if got := groupDashboardRowsByNetwork(nil); len(got) != 0 {
-		t.Fatalf("expected no groups for empty input, got %+v", got)
+	req := httptest.NewRequest(http.MethodGet, "/logout", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: token})
+	rec := httptest.NewRecorder()
+	logoutHandler(rec, req)
+
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
+		t.Fatalf("expected redirect to /login, got status=%d location=%q", rec.Code, rec.Header().Get("Location"))
+	}
+	sessionsMu.Lock()
+	_, stillPresent := sessions[token]
+	sessionsMu.Unlock()
+	if stillPresent {
+		t.Fatalf("expected the session to be removed from the store after logout")
 	}
 }
 

@@ -155,7 +155,7 @@ Commands (work in groups as well as DMs):
 /upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA
 /help — show this help
 
-Alerts: 🟡 missed blocks > 50, 🔴 missed blocks ≥ 150, 📉 uptime dropping, 🟢 recovering, 🚨 jailed / tombstoned. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
+Alerts: 🔴 missed blocks +100 in a check or window uptime < 80%, 🟡 uptime -1% or missed blocks +50-100 in a check, 🟢 recovering, 🚨 jailed / tombstoned. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
 
 // MainHandler ...
 func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
@@ -537,34 +537,87 @@ func getSignedBlocksWindow(prefix string) int64 {
 	return getSlashingParamsCached(prefix).Window
 }
 
+// joinReasons turns a list of lowercase reason fragments (e.g. "uptime
+// dropped 1.30 points since the last check") into a single capitalized,
+// semicolon-separated sentence fragment
+func joinReasons(reasons []string) string {
+	s := strings.Join(reasons, "; ")
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
 // decideMissedBlocksAlert is the decision logic behind CheckValidator's
-// missed-blocks alerting: total (raw) missed blocks against fixed
-// thresholds, plus a separate alert whenever the slashing-window uptime %
-// drops by a meaningful amount since the last check. No history beyond the
-// previous check is kept. It touches no global state so it can be tested
-// without a network call.
+// missed-blocks alerting. Everything is evaluated fresh each check against
+// only the current reading and the previous one — there is no persisted
+// "how bad has this gotten historically" state — so a validator whose
+// missed-blocks counter is merely staying high while trending down does not
+// keep re-triggering the same alert; only an actual worsening this check
+// (a missed-blocks jump, an uptime drop) or being critically low right now
+// (window uptime under CriticalUptimePercent) fires anything.
+//
+//	Critical: missed blocks jumped by more than CriticalMissedBlocksDelta
+//	          this check, OR window uptime is currently below CriticalUptimePercent.
+//	Normal:   window uptime dropped by at least UptimeDropAlertPercent points
+//	          since the last check, OR missed blocks increased by
+//	          NormalMissedBlocksDelta..CriticalMissedBlocksDelta this check.
+//	Recovery: previously alerting, and neither of the above holds anymore.
+//
+// It touches no global state so it can be tested without a network call.
 func decideMissedBlocksAlert(name string, currentMissedBlocks, window int64, hasPrevious bool, previousMissedBlocks int64, level string) (alerts []string, newLevel string) {
 	newLevel = level
 
-	if hasPrevious && window > 0 {
+	haveUptime := window > 0
+	var uptimePct float64
+	if haveUptime {
+		uptimePct = float64(window-currentMissedBlocks) * 100 / float64(window)
+	}
+
+	var delta int64
+	if hasPrevious {
+		delta = currentMissedBlocks - previousMissedBlocks
+	}
+
+	var criticalReasons, normalReasons []string
+	if hasPrevious && delta > config.CriticalMissedBlocksDelta {
+		criticalReasons = append(criticalReasons, fmt.Sprintf("missed blocks increased by %d in this check", delta))
+	}
+	if haveUptime && uptimePct < config.CriticalUptimePercent {
+		criticalReasons = append(criticalReasons, fmt.Sprintf("window uptime is below %.0f%%", config.CriticalUptimePercent))
+	}
+	if hasPrevious && haveUptime {
 		previousUptime := float64(window-previousMissedBlocks) * 100 / float64(window)
-		currentUptime := float64(window-currentMissedBlocks) * 100 / float64(window)
-		if previousUptime-currentUptime >= config.UptimeDropAlertPercent {
-			alerts = append(alerts, fmt.Sprintf("📉 *Uptime Dropping*\n\n%s's slashing-window uptime dropped from *%.2f%%* to *%.2f%%* (missed blocks %d → %d).", name, previousUptime, currentUptime, previousMissedBlocks, currentMissedBlocks))
+		if drop := previousUptime - uptimePct; drop >= config.UptimeDropAlertPercent {
+			normalReasons = append(normalReasons, fmt.Sprintf("uptime dropped %.2f points since the last check", drop))
 		}
+	}
+	if hasPrevious && delta >= config.NormalMissedBlocksDelta && delta <= config.CriticalMissedBlocksDelta {
+		normalReasons = append(normalReasons, fmt.Sprintf("missed blocks increased by %d in this check", delta))
+	}
+
+	var uptimeLine, deltaSuffix string
+	if haveUptime {
+		uptimeLine = fmt.Sprintf("\nUptime: *%.2f%%*", uptimePct)
+	}
+	if hasPrevious {
+		deltaSuffix = fmt.Sprintf(" (%+d this check)", delta)
 	}
 
 	switch {
-	case currentMissedBlocks >= config.MissedBlocksCriticalLimit:
-		alerts = append(alerts, fmt.Sprintf("🔴 *CRITICAL: Missing Blocks*\n\n%s has missed *%d* blocks. Please check the node immediately.", name, currentMissedBlocks))
+	case len(criticalReasons) > 0:
+		alerts = append(alerts, fmt.Sprintf("🔴 *CRITICAL: Missing Blocks*\n\n%s\nMissed blocks: *%d*%s%s\n\n%s. Please check the node immediately.",
+			name, currentMissedBlocks, deltaSuffix, uptimeLine, joinReasons(criticalReasons)))
 		newLevel = "critical"
 
-	case currentMissedBlocks > config.MissedBlocksAlertLimit:
-		alerts = append(alerts, fmt.Sprintf("🟡 *Missed Blocks Alert*\n\n%s has missed *%d* blocks.", name, currentMissedBlocks))
+	case len(normalReasons) > 0:
+		alerts = append(alerts, fmt.Sprintf("🟡 *Missed Blocks Alert*\n\n%s\nMissed blocks: *%d*%s%s\n\n%s.",
+			name, currentMissedBlocks, deltaSuffix, uptimeLine, joinReasons(normalReasons)))
 		newLevel = "normal"
 
 	case level != "":
-		alerts = append(alerts, fmt.Sprintf("🟢 *Recovering*\n\n%s is back to normal, missed blocks: *%d*.", name, currentMissedBlocks))
+		alerts = append(alerts, fmt.Sprintf("🟢 *Recovering*\n\n%s\nMissed blocks: *%d*%s%s",
+			name, currentMissedBlocks, deltaSuffix, uptimeLine))
 		newLevel = ""
 	}
 
