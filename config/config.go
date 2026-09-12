@@ -1,6 +1,10 @@
 package config
 
-import "os"
+import (
+	"log"
+	"os"
+	"strconv"
+)
 
 var (
 	BOT_API_KEY          = os.Getenv("BOT_API_KEY")
@@ -17,6 +21,14 @@ var (
 	// The web server does not start unless both are set.
 	WebUsername = os.Getenv("WEB_USERNAME")
 	WebPassword = os.Getenv("WEB_PASSWORD")
+
+	// MissedBlocksChatID/UpgradesChatID/JailedChatID are the fixed Telegram
+	// chats (DM, group or channel) each alert type is posted to, in place of
+	// DMing every subscriber individually. A chat left unset (0) means that
+	// alert type is dropped (logged, not sent) rather than silently lost.
+	MissedBlocksChatID = parseChatID("MISSED_BLOCKS_CHAT_ID")
+	UpgradesChatID     = parseChatID("UPGRADES_CHAT_ID")
+	JailedChatID       = parseChatID("JAILED_CHAT_ID")
 )
 
 func envOrDefault(key, def string) string {
@@ -24,6 +36,18 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func parseChatID(envVar string) int64 {
+	v := os.Getenv(envVar)
+	if v == "" {
+		return 0
+	}
+	id, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		log.Fatalf("Invalid %s %q: %v", envVar, v, err)
+	}
+	return id
 }
 
 const (

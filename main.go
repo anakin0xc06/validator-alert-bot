@@ -148,14 +148,14 @@ func runSafe(name string, fn func()) {
 const helpText = `*Cosmic Validator Alerts Bot*
 
 Commands (work in groups as well as DMs):
-/subscribe ` + "`<valcons addresses ...>`" + ` — subscribe to missed-block, uptime and jailing alerts. Alerts are always DM'd to you directly, so message me privately at least once or they won't arrive.
-/unsubscribe — remove all your subscriptions
+/subscribe ` + "`<valcons addresses ...>`" + ` — start monitoring one or more validators for missed-block, jailing and chain-upgrade alerts. These are posted to their configured Telegram channels, not DM'd (see below) — the 6-hourly health ping is still DM'd to you, so message me privately at least once or that won't arrive.
+/unsubscribe — stop monitoring your validators
 /uptime — signing window, missed blocks and uptime of your validators
 /dashboard — uptime and safety for every validator configured in validator_aliases.json
 /upgrades — list active chain-upgrade proposals (voting or passed), target heights and ETA
 /help — show this help
 
-Alerts: 🔴 missed blocks +100 in a check or window uptime < 80%, 🟡 uptime -1% or missed blocks +50-100 in a check, 🟢 recovering, 🚨 jailed / tombstoned. A 💚 health ping is sent every 6 hours. Chain upgrades: 🗳 proposal in voting, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled.`
+Alerts are posted to per-type channels (MISSED_BLOCKS_CHAT_ID / JAILED_CHAT_ID / UPGRADES_CHAT_ID): 🔴 missed blocks +100 in a check or window uptime < 80%, 🟡 uptime -1% or missed blocks +50-100 in a check, 🟢 recovering, 🚨 jailed / tombstoned, ✅ unjailed. Chain upgrades: 🗳 proposal entered voting, ❌ proposal rejected/expired, ⏰ upgrade incoming (1 day and 1-2 hours before, once passed), ✅ upgrade height reached, ⚠️ upgrade cancelled. A 💚 health ping is still DM'd to each subscriber every 6 hours.`
 
 // MainHandler ...
 func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
@@ -165,11 +165,12 @@ func MainHandler(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	command := update.Message.Command()
 	log.Printf("Command /%s from user %d", command, helpers.GetUserID(update))
 
-	// All commands work in both group chats and DMs. /subscribe is the one
-	// exception worth calling out: alerts are always delivered by DM'ing
-	// the subscribing user directly (sendTo uses their user ID as the chat
-	// ID), which silently fails if that user has never messaged the bot
-	// privately, regardless of which chat they ran /subscribe from.
+	// All commands work in both group chats and DMs. /subscribe just
+	// registers validators for background monitoring: missed-block, jailing
+	// and upgrade alerts are posted to their configured channels (not
+	// DM'd), but the 6-hourly health ping still DMs the subscribing user
+	// directly, which silently fails if that user has never messaged the
+	// bot privately, regardless of which chat they ran /subscribe from.
 	switch command {
 	case "start", "help":
 		helpers.SendMessage(bot, update, helpText, tgbotapi.ModeMarkdown)
@@ -216,9 +217,9 @@ func HandleSubscribe(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 			}
 			saveJSONFile(config.SubscribersFile, subscribers)
 			subsMu.Unlock()
-			confirmation := "Subscribed to alerts. Use /uptime to see the current status."
+			confirmation := "Subscribed. Your validators are now monitored for missed-block, jailing and upgrade alerts, posted to their configured channels (see /help). Use /uptime to see the current status."
 			if !update.Message.Chat.IsPrivate() {
-				confirmation += fmt.Sprintf("\n\n❗ Alerts are delivered by DM. If you haven't messaged me privately before, open https://t.me/%s and press Start, or alerts won't reach you.", bot.Self.UserName)
+				confirmation += fmt.Sprintf("\n\n❗ The 6-hourly health ping is still sent by DM. If you haven't messaged me privately before, open https://t.me/%s and press Start, or it won't reach you.", bot.Self.UserName)
 			}
 			helpers.SendMessage(bot, update, confirmation, tgbotapi.ModeHTML)
 			return
@@ -624,22 +625,23 @@ func decideMissedBlocksAlert(name string, currentMissedBlocks, window int64, has
 	return alerts, newLevel
 }
 
-// CheckValidator inspects a validator's signing info and returns the alerts to send
-func CheckValidator(validator string) []string {
-	var alerts []string
+// CheckValidator inspects a validator's signing info and returns the alerts
+// to send, split by destination channel: jailedAlerts (jailed/unjailed/
+// tombstoned) and missedBlockAlerts (the missed-blocks state machine)
+func CheckValidator(validator string) (jailedAlerts, missedBlockAlerts []string) {
 	prefix := getPrefix(validator)
 	if len(prefix) == 0 || len(networks[prefix]) == 0 {
-		return nil
+		return nil, nil
 	}
 	info, err := helpers.GetSigningInfo(networks[prefix]["rest"], validator)
 	if err != nil {
 		log.Printf("Error fetching signing info for %s: %v", validator, err)
-		return nil
+		return nil, nil
 	}
 	currentMissedBlocks, err := strconv.ParseInt(info.MissedBlocksCounter, 10, 64)
 	if err != nil {
 		log.Printf("Bad missed blocks counter for %s: %v", validator, err)
-		return nil
+		return nil, nil
 	}
 	name := displayName(validator)
 	window := getSignedBlocksWindow(prefix)
@@ -651,27 +653,29 @@ func CheckValidator(validator string) []string {
 	jailedNow := info.Tombstoned || info.JailedUntil.After(time.Now().UTC())
 	if jailedNow && !validatorJailed[validator] {
 		if info.Tombstoned {
-			alerts = append(alerts, fmt.Sprintf("🚨 *CRITICAL: Validator Tombstoned*\n\n%s has been tombstoned (permanently jailed for double signing).", name))
+			jailedAlerts = append(jailedAlerts, fmt.Sprintf("🚨 *CRITICAL: Validator Tombstoned*\n\n%s has been tombstoned (permanently jailed for double signing).", name))
 		} else {
-			alerts = append(alerts, fmt.Sprintf("🚨 *Validator Jailed*\n\n%s has been jailed until %s.", name, info.JailedUntil.Format(time.RFC1123)))
+			jailedAlerts = append(jailedAlerts, fmt.Sprintf("🚨 *Validator Jailed*\n\n%s has been jailed until %s.", name, info.JailedUntil.Format(time.RFC1123)))
 		}
 	}
 	if !jailedNow && validatorJailed[validator] {
-		alerts = append(alerts, fmt.Sprintf("✅ *Validator Unjailed*\n\n%s is out of jail and can rejoin the active set.", name))
+		jailedAlerts = append(jailedAlerts, fmt.Sprintf("✅ *Validator Unjailed*\n\n%s is out of jail and can rejoin the active set.", name))
 	}
 	validatorJailed[validator] = jailedNow
 
 	previousMissedBlocks, hasPrevious := validatorsMissedBlocks[validator]
 	level := validatorAlertLevels[validator]
 
-	missedAlerts, newLevel := decideMissedBlocksAlert(name, currentMissedBlocks, window, hasPrevious, previousMissedBlocks, level)
-	alerts = append(alerts, missedAlerts...)
+	missedBlockAlerts, newLevel := decideMissedBlocksAlert(name, currentMissedBlocks, window, hasPrevious, previousMissedBlocks, level)
 	validatorAlertLevels[validator] = newLevel
 	validatorsMissedBlocks[validator] = currentMissedBlocks
-	for i := range alerts {
-		alerts[i] = withMintscanLink(alerts[i], validator)
+	for i := range jailedAlerts {
+		jailedAlerts[i] = withMintscanLink(jailedAlerts[i], validator)
 	}
-	return alerts
+	for i := range missedBlockAlerts {
+		missedBlockAlerts[i] = withMintscanLink(missedBlockAlerts[i], validator)
+	}
+	return jailedAlerts, missedBlockAlerts
 }
 
 func copySubscribers() map[string][]string {
@@ -684,35 +688,49 @@ func copySubscribers() map[string][]string {
 	return subsCopy
 }
 
-func sendTo(bot *tgbotapi.BotAPI, userId int64, text string) {
-	msg := tgbotapi.NewMessage(userId, text)
+func sendTo(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = tgbotapi.ModeMarkdown
 	if _, err := bot.Send(msg); err != nil {
-		log.Printf("Failed to send message to %d: %v", userId, err)
+		log.Printf("Failed to send message to %d: %v", chatID, err)
 	}
 }
 
+// sendToChat delivers an alert to one of the fixed per-alert-type channels
+// (config.MissedBlocksChatID / UpgradesChatID / JailedChatID). A chatID of 0
+// means that channel isn't configured, so the alert is dropped (logged, not
+// sent nowhere silently) rather than crashing or falling back to a DM.
+func sendToChat(bot *tgbotapi.BotAPI, chatID int64, text string) {
+	if chatID == 0 {
+		log.Printf("No chat configured for this alert type, dropping: %s", text)
+		return
+	}
+	sendTo(bot, chatID, text)
+}
+
+// HandleSubscribers checks every validator anyone is subscribed to and posts
+// jailed/unjailed alerts to config.JailedChatID and missed-blocks alerts to
+// config.MissedBlocksChatID. Each validator is checked once regardless of
+// how many users subscribe to it, and each resulting alert is posted once to
+// its channel (not once per subscriber).
 func HandleSubscribers(bot *tgbotapi.BotAPI) {
 	log.Println("Checking missed blocks ...")
 	subsCopy := copySubscribers()
-	alertsByValidator := make(map[string][]string)
-	for _, validators := range subsCopy {
-		for _, validator := range validators {
-			if _, checked := alertsByValidator[validator]; !checked {
-				alertsByValidator[validator] = CheckValidator(validator)
-			}
+	validators := make(map[string]bool)
+	for _, vs := range subsCopy {
+		for _, v := range vs {
+			validators[v] = true
 		}
 	}
-	for user, validators := range subsCopy {
-		userId, err := strconv.ParseInt(user, 10, 64)
-		if err != nil {
-			continue
+	for validator := range validators {
+		jailedAlerts, missedBlockAlerts := CheckValidator(validator)
+		for _, text := range jailedAlerts {
+			log.Println(text)
+			sendToChat(bot, config.JailedChatID, text)
 		}
-		for _, validator := range validators {
-			for _, text := range alertsByValidator[validator] {
-				log.Println(text)
-				sendTo(bot, userId, text)
-			}
+		for _, text := range missedBlockAlerts {
+			log.Println(text)
+			sendToChat(bot, config.MissedBlocksChatID, text)
 		}
 	}
 	saveValidatorState()

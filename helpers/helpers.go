@@ -339,8 +339,16 @@ func GetCurrentUpgradePlan(restApi string) (*ChainUpgradePlan, error) {
 	if err != nil || height <= 0 {
 		return nil, nil
 	}
-	return &ChainUpgradePlan{Name: body.Plan.Name, Height: height, Info: body.Plan.Info, Status: govStatusPassed}, nil
+	// govProposalStatusPassed (not govStatusPassed, which is the numeric "3"
+	// used for the proposal_status query param) is the status enum string
+	// callers compare ChainUpgradePlan.Status against
+	return &ChainUpgradePlan{Name: body.Plan.Name, Height: height, Info: body.Plan.Info, Status: govProposalStatusPassed}, nil
 }
+
+// govProposalStatusPassed is the proposal status string the gov REST APIs
+// report once a proposal has passed, used to mark plans discovered only via
+// current_plan (which have no proposal of their own to read a status off of)
+const govProposalStatusPassed = "PROPOSAL_STATUS_PASSED"
 
 // govAnyEnvelope decodes the flattened cosmos-sdk Any JSON encoding used for
 // both gov v1 proposal messages and gov v1beta1 proposal content, e.g.

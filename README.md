@@ -1,6 +1,7 @@
 # validator-alert-bot
 
-Telegram bot that watches Cosmos-SDK validators and alerts subscribers about missed blocks, uptime drops and jailing events.
+Telegram bot that watches Cosmos-SDK validators and alerts about missed blocks, uptime drops,
+jailing events and chain upgrades — each posted to its own configured Telegram chat.
 
 ## Features
 
@@ -16,11 +17,30 @@ Telegram bot that watches Cosmos-SDK validators and alerts subscribers about mis
     last check, OR missed blocks increased by 50-100 in a single check
   - 🟢 **Recovering** — was previously alerting, and neither condition above holds anymore
 - 🚨 Jailing / tombstoning alerts and ✅ unjail notices
-- 💚 Health ping every **6 hours** with a per-validator status summary, so you know the bot itself is alive
-- ⏰ Chain-upgrade watcher: tracks governance software-upgrade proposals per network — from voting period through passed — and warns **1 day** and **1-2 hours** before the estimated upgrade time (see below)
+- 💚 Health ping every **6 hours** with a per-validator status summary, DM'd to each subscriber so
+  you know the bot itself is alive
+- ⏰ Chain-upgrade watcher: tracks governance software-upgrade proposals per network, alerting once
+  when a proposal **enters voting** and again as it approaches (and reaches) its target height (see below)
 - Alert state is persisted in `./data`, so restarts do not re-send alerts
 - Supports any network listed in [config/networks.json](config/networks.json); validators are identified by their bech32 `valcons` address
 - Optional web dashboard: the same uptime/safety report as `/dashboard`, as an HTML page (see below)
+
+## Alert channels
+
+Missed-block, jailing and upgrade alerts are posted to three separate Telegram chats (DM, group or
+channel — anything the bot is a member of) instead of being DM'd to every subscriber, so different
+alert types can go to different audiences:
+
+| Env var | Alerts posted there |
+|---|---|
+| `MISSED_BLOCKS_CHAT_ID` | 🔴/🟡/🟢 missed-blocks alerts |
+| `JAILED_CHAT_ID` | 🚨 jailed/tombstoned, ✅ unjailed |
+| `UPGRADES_CHAT_ID` | 🗳 voting, ❌ rejected/expired, ⏰ incoming, ✅ height reached, ⚠️ cancelled |
+
+Each is a numeric Telegram chat ID (negative for groups/channels, e.g. `-1001234567890`). Get one by
+adding the bot to the target chat and checking `getUpdates`, or via a helper bot like `@userinfobot`
+/ `@RawDataBot`. A channel left unset means that alert type is dropped (logged, not sent) rather
+than falling back to a DM. The 💚 health ping is unaffected and is still DM'd per subscriber.
 
 ## Bot commands
 
@@ -28,8 +48,8 @@ All commands work in group chats as well as DMs.
 
 | Command | Description |
 |---|---|
-| `/subscribe <valcons addresses ...>` | Subscribe to alerts for one or more validators. Alerts are always sent by DM to the subscribing user, regardless of which chat `/subscribe` was run from — if that user has never messaged the bot privately, Telegram won't let it DM them, so alerts silently never arrive. Run it from a group and the confirmation message calls this out with a link to start a DM. |
-| `/unsubscribe` | Remove all your subscriptions |
+| `/subscribe <valcons addresses ...>` | Start monitoring one or more validators for missed-block, jailing and upgrade alerts — posted to the channels above, not DM'd. The 6-hourly health ping still DMs the subscribing user, regardless of which chat `/subscribe` was run from — if that user has never messaged the bot privately, Telegram won't let it DM them, so the ping silently never arrives. Run it from a group and the confirmation message calls this out with a link to start a DM. |
+| `/unsubscribe` | Stop monitoring your validators |
 | `/uptime` | Show window size, currently missed blocks, uptime % and 🟢/🔴 safety per validator you're subscribed to |
 | `/dashboard` | Show uptime % and safety for **every** validator configured in `config/validator_aliases.json`, grouped by network — not just your own subscriptions. Safety here is based on the chain's real `min_signed_per_window` slashing param rather than a flat percentage, so it's a more accurate jail-risk signal than `/uptime`'s 🔴 |
 | `/upgrades` | List full details (proposal, target height, ETA) for every currently tracked chain-upgrade |
@@ -43,20 +63,20 @@ Every **15 minutes** the bot polls each network in [config/networks.json](config
 governance proposals of the software-upgrade type — both **voting period** and **passed** —
 (checking both the modern `gov/v1` message format and the legacy `gov/v1beta1` proposal-content
 format, plus the `x/upgrade` module's own `current_plan` query as a fallback for passed plans).
-Voting-period proposals show up in `/upgrades` right away as an early heads-up (🗳, not yet
-confirmed — the vote could still fail), but push alerts and ETA calculations only start once a
-proposal has actually passed, since only then is the target height confirmed on-chain. For each
-passed upgrade the bot tracks the target height and estimates time-to-upgrade from a
-self-measured average block time (sampled each check cycle, so the estimate adapts to each
-chain's real block speed and survives restarts). Subscribers are notified based on the networks
-of their subscribed validators:
+Alerts are only posted for networks that have at least one subscribed validator:
 
-- ⏰ **Upgrade Incoming** — fires once ~24 hours out and again once ~1-2 hours out (passed upgrades only)
+- 🗳 **Upgrade Proposal In Voting** — fires once, as soon as a software-upgrade proposal enters
+  voting (not yet confirmed — the vote could still fail or miss quorum)
+- ❌ **Upgrade Proposal Rejected/Expired** — a proposal that got the voting alert above did not
+  pass and is no longer being tracked
+- ⏰ **Upgrade Incoming** — fires once ~24 hours out and again once ~1-2 hours out, once the
+  proposal has passed and the target height is confirmed on-chain
 - ✅ **Upgrade Height Reached** — the target height has been passed; the upgrade is removed from state
 - ⚠️ **Upgrade Cancelled** — a cancellation was observed via governance; the upgrade is removed from state
 
-A voting-period proposal that gets rejected or fails is quietly dropped from tracking (no alert,
-since none was ever sent for it). Upgrade-watcher state is persisted to `./data/upgrades.json`.
+A voting-period proposal that disappears from discovery *before* the voting alert ever fired is
+quietly dropped (nothing was ever alerted on it). Upgrade-watcher state is persisted to
+`./data/upgrades.json`.
 
 ## Validator aliases (optional)
 
@@ -97,16 +117,24 @@ authenticate with those credentials.
 
 ```sh
 export BOT_API_KEY=<telegram bot token from @BotFather>
+export MISSED_BLOCKS_CHAT_ID=<chat id>
+export UPGRADES_CHAT_ID=<chat id>
+export JAILED_CHAT_ID=<chat id>
 go build -o validator-alert-bot .
 ./validator-alert-bot
 ```
 
-Runtime state is written to `./data` (created automatically).
+Runtime state is written to `./data` (created automatically). The three `*_CHAT_ID` vars are
+optional individually — any left unset just drops that alert type (logged, not sent) — but set all
+three for full coverage; see [Alert channels](#alert-channels) above for how to get a chat ID.
 
 ### Docker Compose (recommended)
 
 ```sh
 echo 'BOT_API_KEY=<token>' > .env
+echo 'MISSED_BLOCKS_CHAT_ID=<chat id>' >> .env
+echo 'UPGRADES_CHAT_ID=<chat id>' >> .env
+echo 'JAILED_CHAT_ID=<chat id>' >> .env
 # optional, to enable the web dashboard:
 echo 'WEB_USERNAME=admin' >> .env
 echo 'WEB_PASSWORD=<pick something>' >> .env
@@ -124,6 +152,9 @@ dashboard, if enabled, is published on port `8080` (override with `WEB_PORT` in 
 docker build -t validator-alert-bot .
 docker run -d --name validator-alert-bot \
   -e BOT_API_KEY=<token> \
+  -e MISSED_BLOCKS_CHAT_ID=<chat id> \
+  -e UPGRADES_CHAT_ID=<chat id> \
+  -e JAILED_CHAT_ID=<chat id> \
   -e WEB_USERNAME=admin \
   -e WEB_PASSWORD=<pick something> \
   -p 8080:8080 \
@@ -142,6 +173,9 @@ After=network-online.target
 [Service]
 WorkingDirectory=/opt/validator-alert-bot
 Environment=BOT_API_KEY=<token>
+Environment=MISSED_BLOCKS_CHAT_ID=<chat id>
+Environment=UPGRADES_CHAT_ID=<chat id>
+Environment=JAILED_CHAT_ID=<chat id>
 # optional, to enable the web dashboard:
 Environment=WEB_USERNAME=admin
 Environment=WEB_PASSWORD=<pick something>

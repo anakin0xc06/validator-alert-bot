@@ -5,6 +5,10 @@ services:
     restart: unless-stopped
     environment:
       - BOT_API_KEY=${BOT_API_KEY}
+      # per-alert-type destination chats; unset ones just drop that alert type
+      - MISSED_BLOCKS_CHAT_ID=${MISSED_BLOCKS_CHAT_ID:-}
+      - UPGRADES_CHAT_ID=${UPGRADES_CHAT_ID:-}
+      - JAILED_CHAT_ID=${JAILED_CHAT_ID:-}
       # optional: set both to enable the web dashboard (disabled without them)
       - WEB_USERNAME=${WEB_USERNAME:-}
       - WEB_PASSWORD=${WEB_PASSWORD:-}

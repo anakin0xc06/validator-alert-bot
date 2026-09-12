@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,15 +13,20 @@ import (
 	tgbotapi "gopkg.in/telegram-bot-api.v4"
 )
 
-// govStatusPassed is the proposal status string the gov REST APIs report
-// once a proposal has passed (as opposed to still being voted on)
-const govStatusPassed = "PROPOSAL_STATUS_PASSED"
+// govStatusVotingPeriod/govStatusPassed are the proposal status strings the
+// gov REST APIs report while a proposal is being voted on and once it has
+// passed, respectively
+const (
+	govStatusVotingPeriod = "PROPOSAL_STATUS_VOTING_PERIOD"
+	govStatusPassed       = "PROPOSAL_STATUS_PASSED"
+)
 
 // TrackedUpgrade is a scheduled chain upgrade the bot is watching, persisted
 // across restarts so alerts are not re-sent. Upgrades whose proposal is
-// still in the voting period are tracked (and shown in /upgrades) so
-// operators get an early heads-up, but only ever alerted on automatically
-// once Status reaches govStatusPassed, since a plan isn't confirmed until then.
+// still in the voting period are tracked (and shown in /upgrades), and an
+// early heads-up alert fires once when a proposal first enters voting.
+// Height-based alerts (ETA warnings, height reached) only ever fire once
+// Status reaches govStatusPassed, since a plan isn't confirmed until then.
 type TrackedUpgrade struct {
 	Network       string    `json:"network"`
 	ProposalID    string    `json:"proposal_id"`
@@ -31,6 +35,7 @@ type TrackedUpgrade struct {
 	Info          string    `json:"info,omitempty"`
 	Status        string    `json:"status"`
 	VotingEndTime time.Time `json:"voting_end_time,omitempty"`
+	AlertedVoting bool      `json:"alerted_voting"`
 	AlertedDay    bool      `json:"alerted_day"`
 	AlertedHour   bool      `json:"alerted_hour"`
 }
@@ -170,26 +175,27 @@ func checkNetworkUpgrade(prefix, rest, rpc string) []string {
 		}
 		key := upgradeKey(prefix, plan)
 		discovered[key] = true
-		if tracked, exists := trackedUpgrades[key]; exists {
-			tracked.Height = plan.Height
-			tracked.Name = plan.Name
-			tracked.Status = plan.Status
-			tracked.VotingEndTime = plan.VotingEndTime
-			if plan.ProposalID != "" {
-				tracked.ProposalID = plan.ProposalID
-			}
-			continue
+		tracked, exists := trackedUpgrades[key]
+		if !exists {
+			tracked = &TrackedUpgrade{Network: prefix}
+			trackedUpgrades[key] = tracked
+			log.Printf("Tracking new upgrade on %s: %s at height %d (proposal #%s, status %s)", prefix, plan.Name, plan.Height, plan.ProposalID, plan.Status)
 		}
-		trackedUpgrades[key] = &TrackedUpgrade{
-			Network:       prefix,
-			ProposalID:    plan.ProposalID,
-			Name:          plan.Name,
-			Height:        plan.Height,
-			Info:          plan.Info,
-			Status:        plan.Status,
-			VotingEndTime: plan.VotingEndTime,
+		tracked.Height = plan.Height
+		tracked.Name = plan.Name
+		tracked.Info = plan.Info
+		tracked.Status = plan.Status
+		tracked.VotingEndTime = plan.VotingEndTime
+		if plan.ProposalID != "" {
+			tracked.ProposalID = plan.ProposalID
 		}
-		log.Printf("Tracking new upgrade on %s: %s at height %d (proposal #%s, status %s)", prefix, plan.Name, plan.Height, plan.ProposalID, plan.Status)
+		// early heads-up the moment a proposal enters voting, fired once;
+		// a proposal first discovered already-passed never gets this alert,
+		// since it was never actually seen in voting
+		if tracked.Status == govStatusVotingPeriod && !tracked.AlertedVoting {
+			tracked.AlertedVoting = true
+			alerts = append(alerts, votingAlertText(prefix, tracked))
+		}
 	}
 
 	for key, tracked := range trackedUpgrades {
@@ -197,10 +203,15 @@ func checkNetworkUpgrade(prefix, rest, rpc string) []string {
 			continue
 		}
 		// a still-voting proposal that dropped out of discovery was either
-		// rejected/failed or expired; nothing was ever alerted on it, so
-		// just drop it quietly. Passed upgrades are never pruned this way
+		// rejected/failed or expired. If we alerted when it entered voting,
+		// tell subscribers it's resolved instead of just going silent;
+		// otherwise (e.g. it never lived long enough to be seen) drop it
+		// quietly, same as before. Passed upgrades are never pruned this way
 		// (they persist purely on height, in case they fall off pagination).
 		if tracked.Status != govStatusPassed && !discovered[key] {
+			if tracked.AlertedVoting {
+				alerts = append(alerts, rejectedAlertText(prefix, tracked))
+			}
 			log.Printf("Dropping no-longer-active upgrade proposal on %s: %s (proposal #%s)", prefix, tracked.Name, tracked.ProposalID)
 			delete(trackedUpgrades, key)
 			continue
@@ -232,6 +243,32 @@ func checkNetworkUpgrade(prefix, rest, rpc string) []string {
 	return alerts
 }
 
+func votingAlertText(prefix string, u *TrackedUpgrade) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🗳 *Upgrade Proposal In Voting: %s*\n\n", strings.ToUpper(prefix)))
+	sb.WriteString(fmt.Sprintf("Upgrade: *%s*\n", u.Name))
+	if u.ProposalID != "" {
+		sb.WriteString(fmt.Sprintf("Proposal: #%s\n", u.ProposalID))
+	}
+	sb.WriteString(fmt.Sprintf("Target height: *%d*\n", u.Height))
+	if !u.VotingEndTime.IsZero() {
+		sb.WriteString(fmt.Sprintf("Voting ends: %s\n", u.VotingEndTime.UTC().Format(time.RFC1123)))
+	}
+	sb.WriteString("\nNot yet confirmed — the proposal could still be rejected or fail to reach quorum.")
+	return sb.String()
+}
+
+func rejectedAlertText(prefix string, u *TrackedUpgrade) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("❌ *Upgrade Proposal Rejected/Expired: %s*\n\n", strings.ToUpper(prefix)))
+	sb.WriteString(fmt.Sprintf("Upgrade: *%s*\n", u.Name))
+	if u.ProposalID != "" {
+		sb.WriteString(fmt.Sprintf("Proposal: #%s\n", u.ProposalID))
+	}
+	sb.WriteString("\nThis proposal did not pass and is no longer being tracked.")
+	return sb.String()
+}
+
 func upgradeAlertText(prefix string, u *TrackedUpgrade, eta time.Duration, currentHeight int64) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("⏰ *Upgrade Incoming: %s*\n\n", strings.ToUpper(prefix)))
@@ -256,30 +293,26 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh%dm", h, m)
 }
 
-// HandleUpgrades is the scheduled job: checks every network for upgrade
-// warnings, notifies subscribers who have a validator on the affected
-// network, and persists state
+// HandleUpgrades is the scheduled job: checks every network that has at
+// least one subscribed validator for upgrade warnings, posts them to
+// config.UpgradesChatID, and persists state
 func HandleUpgrades(bot *tgbotapi.BotAPI) {
 	log.Println("Checking for scheduled upgrades ...")
 	alertsByNetwork := CheckUpgrades()
 	if len(alertsByNetwork) > 0 {
 		subsCopy := copySubscribers()
-		for user, validators := range subsCopy {
-			userId, err := strconv.ParseInt(user, 10, 64)
-			if err != nil {
-				continue
-			}
-			userNetworks := make(map[string]bool)
+		subscribedNetworks := make(map[string]bool)
+		for _, validators := range subsCopy {
 			for _, validator := range validators {
 				if prefix := getPrefix(validator); prefix != "" {
-					userNetworks[prefix] = true
+					subscribedNetworks[prefix] = true
 				}
 			}
-			for prefix := range userNetworks {
-				for _, text := range alertsByNetwork[prefix] {
-					log.Println(text)
-					sendTo(bot, userId, text)
-				}
+		}
+		for prefix := range subscribedNetworks {
+			for _, text := range alertsByNetwork[prefix] {
+				log.Println(text)
+				sendToChat(bot, config.UpgradesChatID, text)
 			}
 		}
 	}
